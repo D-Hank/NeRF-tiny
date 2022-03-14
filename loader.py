@@ -1,5 +1,3 @@
-from cProfile import label
-from email.mime import image
 import numpy as np
 import matplotlib.pyplot as plt
 import os
@@ -7,12 +5,14 @@ import os
 from PIL import Image
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
+from torchvision.utils import make_grid
 
 img_dir = "../nerf_llff_data/fern/"
 low_res = 8
 
 poses_bounds = np.load(img_dir + "poses_bounds.npy")
-simplices = np.load(img_dir + "simplices.npy")
+#np.savetxt("poses_bounds.txt", poses_bounds)
+#simplices = np.load(img_dir + "simplices.npy")
 
 #poses = poses_bounds[:, :-2].reshape(-1, 3, 5)
 #print(poses_bounds)
@@ -63,15 +63,13 @@ class NeRFDataset(Dataset):
     def __getitem__(self, idx):
         img_path = self.file_list[idx]
         img = Image.open(img_path)
-        label = idx
 
-        sample = {"image": img, "label": label}
+        sample = {"image": img, "pose": poses_bounds[idx]}
         return sample
 
 train_dataset = NeRFDataset(root_dir = img_dir + "images_8/", transform = None)
 train_dataloader = DataLoader(dataset = train_dataset, batch_size = 4, shuffle = True, num_workers = 4)
-
-
+#print(poses_bounds[0])
 
 '''
 plt.figure()
