@@ -90,9 +90,50 @@ class NeRFModel():
         return self.network.forward(point_enc, dir_enc)
 
     # Get cdf of coarse sampling, then with its reverse, we use uniform sampling along the horizontal axis
-    def resample(self, t_coarse):
+    def resample(self, t_coarse, sigma_coarse):
+        cdf = torch.cumsum(sigma_coarse, dim = 0)
+        '''
+        plt.figure()
+        plt.plot(t_coarse.numpy(), cdf.numpy(), label='PDF of values')
+        plt.legend()
+        plt.xlabel('Value')
+        plt.ylabel('Probability')
+        output_image = "ex.png"
+        plt.savefig(output_image)
+        plt.show()
+        '''
+        high = max(cdf)
+        low = min(cdf)
+        delta = t_coarse[1] - t_coarse[0]
+        delta_inv = (high - low) / self.num_fine
         # Slope of cdf is not zero, so its inverse is not infinite
-        pass
+        slope = sigma_coarse[1: ] / delta
+        slope_inv = 1.0 / slope
+        t_inv = torch.linspace(low, high, self.num_fine + 2)
+        # Ignore first and last
+        #print(t_inv)
+        #t_inv = t_inv[1:-1]
+        # Init value
+        #lower_cdf = torch.clone(cdf[1:-1])
+        #lower_t = torch.clone(t_coarse[1:-1])
+        t_fine = torch.rand(self.num_fine - 1, 1)
+        for i in range(0, self.num_fine + 2):
+            # select those less than
+            sel_le = torch.nonzero(t_inv[i] > cdf)
+            sel_le = sel_le[-1]
+            #lower_cdf[i] = cdf[sel_le]
+            #lower_t[i] = t_coarse[sel_le]
+            t_fine[i] = t_coarse[sel_le] + (t_inv[i] - cdf[sel_le]) * slope_inv[sel_le]
+            #print(sel_le)
+
+        #print(lower_t)
+        #print(lower_cdf)
+        print(t_fine)
+        exit(0)
+        #t_fine = torch.mul((t_inv - lower_cdf), slope_inv) + lower_t
+        print(t_coarse)
+        print(t_fine)
+
 
     # Render a ray
     # Local coordinate: [x, y, z] = [right, up, back]
@@ -117,5 +158,9 @@ class NeRFModel():
         for i in range(0, self.num_coarse):
             color_co[i], sigma_co[i] = self.net_out(p_wrd_co[i], d_wrd)
 
-        #
+        color_fi, sigma_fi = self.resample(t_coarse, sigma_co)
 
+t_c = torch.tensor([100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110])
+s_c = torch.tensor([0.1, 0.15, 0.23, 0.3, 0.5, 0.8, 1.2, 0.9, 0.6, 0.38, 0.2])
+nerf = NeRFModel(num_fine = 10)
+nerf.resample(t_c, s_c)
