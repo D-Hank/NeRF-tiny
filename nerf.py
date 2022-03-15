@@ -84,10 +84,24 @@ class NeRFModel():
         self.num_coarse = num_coarse
         self.num_fine = num_fine
 
-    def net_out(self, point, dir):
-        point_enc, dir_enc = self.encoder.forward(point, dir)
+    def net_out(self, t_array, dir_wrd, dir_cam, trans_mat, num_points):
+        # Notice: homogeneous coordinates here!
+        points_cam = dir_cam.repeat(num_points, 1)
+        points_cam[:, 2] = t_array
+        # [[x, y, z, 1], [x, y, z, 1], ...], points in batch
+        points_wrd = torch.mm(trans_mat, torch.transpose(points_cam))
 
-        return self.network.forward(point_enc, dir_enc)
+        # [[R,G,B], [R,G,B], ...]
+        color = torch.rand(num_points, 3)
+        sigma = torch.rand(num_points, 1)
+        points_wrd = torch.transpose(points_wrd[:3, : ])
+        dir_wrd = torch.transpose(dir_wrd[ :3, : ])
+        # Note: Use dataloader?
+        for i in range(0, num_points):
+            point_enc, dir_enc = self.encoder.forward(points_wrd[i], dir_wrd)
+            color[i], sigma[i] = self.network.forward(point_enc, dir_enc)
+
+        return color, sigma
 
     # Get cdf of coarse sampling, then with its reverse, we use uniform sampling along the horizontal axis
     def resample(self, t_coarse, sigma_coarse):
@@ -112,32 +126,20 @@ class NeRFModel():
 
         #print(t_coarse)
         #print(t_fine)
-
+        return t_fine
 
     # Render a ray
     # Local coordinate: [x, y, z] = [right, up, back]
     def render_ray(self, hor, ver, trans_mat, near, far):
         d_cam = torch.tensor([hor, ver, 1, 1])
         d_wrd = torch.mm(trans_mat, torch.transpose(d_cam))
-        #o_cam = torch.tensor([hor, ver, near, 1])
 
         t_coarse = torch.linspace(near, far, self.num_coarse)
-        p_cam_co = d_cam.repeat(1, self.num_coarse)
-        p_cam_co[:, 2] = t_coarse
-        # [[x, y, z, 1], [x, y, z, 1], ...], points in batch
-        p_wrd_co = torch.mm(trans_mat, torch.transpose(p_cam_co))
+        color_co, sigma_co = self.net_out(t_coarse, d_wrd, d_cam, trans_mat, self.num_coarse)
 
-        # [[R,G,B], [R,G,B], ...]
-        color_co = torch.rand(self.num_coarse, 3)
-        sigma_co = torch.rand(self.num_coarse, 1)
-        p_wrd_co = p_wrd_co[:, :3]
-        d_cam = d_cam[0:3]
-        d_wrd = d_wrd[0:3]
-        # Note: Use dataloader?
-        for i in range(0, self.num_coarse):
-            color_co[i], sigma_co[i] = self.net_out(p_wrd_co[i], d_wrd)
-
-        color_fi, sigma_fi = self.resample(t_coarse, sigma_co)
+        t_fine = self.resample(t_coarse, sigma_co)
+        color_fi, sigma_fi = self.net_out(t_fine, d_wrd, d_cam, trans_mat, self.num_fine)
+        
 
 '''
 #t_c = torch.tensor([100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110])
