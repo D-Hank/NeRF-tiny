@@ -1,13 +1,10 @@
 import math
-from turtle import color, forward
-from unittest import skip
 import numpy as np
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 import matplotlib.pyplot as plt
 
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from tqdm.notebook import tqdm
 
 plt.set_cmap("cividis")
@@ -37,7 +34,7 @@ class Network(nn.Module):
         self.sigma_layer = torch.nn.Linear(width, 1)
 
         # Build layers for direction coordinates
-        self.color_layer = torch.nn.Sequential(torch.nn.Linear(width + point_dim, 3), torch.nn.Sigmoid())
+        self.color_layer = torch.nn.Sequential(torch.nn.Linear(width + dir_dim, 3), torch.nn.Sigmoid())
 
     def forward(self, point, dir):
         point_out = self.point_layer(point)
@@ -76,17 +73,49 @@ class Encoder():
             gamma_point[l + 1] = torch.cos(angle)
 
         gamma_dir = gamma_dir.permute(1, 0)
-        gamma = torch.cat(gamma_point, gamma_dir)
+        gamma = (gamma_point, gamma_dir)
 
         return gamma
 
 class NeRFModel():
-    def __init__(self):
+    def __init__(self, num_coarse = 64, num_fine = 128):
         self.encoder = Encoder()
         self.network = Network()
+        self.num_coarse = num_coarse
+        self.num_fine = num_fine
 
+    def net_out(self, point, dir):
+        point_enc, dir_enc = self.encoder.forward(point, dir)
 
-#a = [[1, 0.1, 0.01], [-1, -0.1, -0.01], [2, 0.2, 0.02], [-2, -0.2, -0.02], [3, 0.3, 0.03], [-3, -0.3, -0.03]]
-#a = torch.tensor(a)
-#print(a.permute(1, 0))
+        return self.network.forward(point_enc, dir_enc)
+
+    # Get cdf of coarse sampling, then with its reverse, we use uniform sampling along the horizontal axis
+    def resample(self, t_coarse):
+        # Slope of cdf is not zero, so its inverse is not infinite
+        pass
+
+    # Render a ray
+    # Local coordinate: [x, y, z] = [right, up, back]
+    def render_ray(self, hor, ver, trans_mat, near, far):
+        d_cam = torch.tensor([hor, ver, 1, 1])
+        d_wrd = torch.mm(trans_mat, torch.transpose(d_cam))
+        #o_cam = torch.tensor([hor, ver, near, 1])
+
+        t_coarse = torch.linspace(near, far, self.num_coarse)
+        p_cam_co = d_cam.repeat(1, self.num_coarse)
+        p_cam_co[:, 2] = t_coarse
+        # [[x, y, z, 1], [x, y, z, 1], ...], points in batch
+        p_wrd_co = torch.mm(trans_mat, torch.transpose(p_cam_co))
+
+        # [[R,G,B], [R,G,B], ...]
+        color_co = torch.rand(self.num_coarse, 3)
+        sigma_co = torch.rand(self.num_coarse, 1)
+        p_wrd_co = p_wrd_co[:, :3]
+        d_cam = d_cam[0:3]
+        d_wrd = d_wrd[0:3]
+        # Note: Use dataloader?
+        for i in range(0, self.num_coarse):
+            color_co[i], sigma_co[i] = self.net_out(p_wrd_co[i], d_wrd)
+
+        #
 
