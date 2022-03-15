@@ -128,9 +128,18 @@ class NeRFModel():
         #print(t_fine)
         return t_fine
 
+    def color_cum(self, delta, sigma, color):
+        sigma_delta = torch.mul(delta, sigma)
+        sum_sd = torch.cumsum(sigma_delta)
+        T = torch.exp(-sum_sd)
+        t_exp = torch.mul(T, 1 - torch.exp(-sigma_delta))
+        term = torch.mul(color, t_exp)
+
+        return torch.sum(term, dim = 1)
+
     # Render a ray
     # Local coordinate: [x, y, z] = [right, up, back]
-    def render_ray(self, hor, ver, trans_mat, near, far):
+    def render_ray(self, hor, ver, trans_mat, near, far, last = 0.0001):
         d_cam = torch.tensor([hor, ver, 1, 1])
         d_wrd = torch.mm(trans_mat, torch.transpose(d_cam))
 
@@ -139,7 +148,25 @@ class NeRFModel():
 
         t_fine = self.resample(t_coarse, sigma_co)
         color_fi, sigma_fi = self.net_out(t_fine, d_wrd, d_cam, trans_mat, self.num_fine)
-        
+
+        # Note: here t is for camara or world?
+        delta_co = torch.full((1, self.num_coarse), (far - near) / self.num_coarse)
+        t = torch.cat(t_coarse, t_fine)
+        color = torch.cat(color_co, color_fi)
+        sigma = torch.cat(sigma_co, sigma_fi)
+        sort_bundle = torch.vstack(t, torch.transpose(color), sigma)
+        bundle = torch.sort(sort_bundle, dim = 1)
+        t = bundle[0]
+        color = bundle[1:4]
+        sigma = bundle[4]
+        # Add a tiny interval at the tail
+        delta = torch.cat(t[1: ] - t[ :-1], last)
+
+        C_coarse = self.color_cum(delta_co, sigma_co, color_co)
+        C_fine = self.color_cum(delta, sigma, color)
+
+        return C_coarse, C_fine
+
 
 '''
 #t_c = torch.tensor([100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110])
@@ -149,3 +176,7 @@ s_c = torch.tensor([1.2, 0.9, 0.8, 0.5, 0.3, 0.6,  0.38, 0.1, 0.15, 0.23, 0.2])
 nerf = NeRFModel(num_fine = 10)
 nerf.resample(t_c, s_c)
 '''
+
+#c = torch.tensor([[2, 3, 4], [4, 5, 6]])
+#f = torch.tensor([2, 1, 2])
+#print(torch.mul(c, f))
