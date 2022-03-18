@@ -1,5 +1,5 @@
 import math
-from matplotlib.colors import colorConverter
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -35,7 +35,7 @@ class Network(nn.Module):
             point_layer = torch.nn.Sequential(point_layer, torch.nn.Linear(width, width), torch.nn.ReLU(True))
 
         self.point_layer = torch.nn.Sequential(point_layer, torch.nn.Linear(width, width))
-        self.sigma_layer = torch.nn.Linear(width, 1)
+        self.sigma_layer = torch.nn.Sequential(torch.nn.Linear(width, 1), torch.nn.Sigmoid())
 
         # Build layers for direction coordinates
         self.color_layer = torch.nn.Sequential(torch.nn.Linear(width + dir_dim, 3), torch.nn.Sigmoid())
@@ -132,17 +132,20 @@ class NeRFModel(nn.Module):
         t_inv = torch.linspace(float(low), float(high), self.num_fine + 2)
         # Init value
         t_inv = t_inv[1:-1]
-        t_fine = torch.rand(self.num_fine, 1)
+        # Row vector
+        t_fine = (torch.rand(1, self.num_fine))[0]
         for i in range(0, self.num_fine):
             # select those less than
             sel_le = torch.nonzero(t_inv[i] > cdf)
             sel_le = sel_le[-1]
             # Linear increment
+            if(sel_le >= 7):
+                print(sel_le)
+                print(t_inv)
+                print(cdf)
             t_fine[i] = t_coarse[sel_le] + (t_inv[i] - cdf[sel_le]) * slope_inv[sel_le]
 
-        # Transform into a row vector
-        t_fine = torch.transpose(t_fine, 0, 1)
-        return t_fine[0]
+        return t_fine
 
     def color_cum(self, delta, sigma, color):
         sigma_delta = torch.mul(delta, sigma)
@@ -203,6 +206,7 @@ class NeRFModel(nn.Module):
         return self.render_ray(hor, -ver, trans_mat, near, far)
 
 img_dir = "../nerf_llff_data/fern/"
+low_res = 8
 EPOCH = 10000
 
 def poses_extract(pb_matrix):
@@ -211,12 +215,12 @@ def poses_extract(pb_matrix):
     hwf = pose[ : , -1]
     height, width, focal = hwf
     near, far = pb_matrix[-2: ]
-    c_to_w = torch.cat((torch.tensor(c_to_w).clone(), torch.tensor([[0.0, 0.0, 0.0, 1.0]])), dim = 0)
+    c_to_w = torch.cat((torch.as_tensor(c_to_w).clone(), torch.tensor([[0.0, 0.0, 0.0, 1.0]])), dim = 0)
     return c_to_w, height, width, focal, near, far
 
 def NeRF_trainer():
-    model = NeRFModel()
-    train_dataset = loader.NeRFDataset(root_dir = img_dir + "images/", transform = None)
+    model = NeRFModel(num_coarse = 8, num_fine = 16)
+    train_dataset = loader.NeRFDataset(root_dir = img_dir + "images_8/", transform = None)
     train_dataloader = DataLoader(dataset = train_dataset, shuffle = True)
 
     optimizer = torch.optim.Adam(model.parameters(), lr = 5e-4, betas = (0.9, 0.999), eps = 1e-7)
@@ -226,24 +230,29 @@ def NeRF_trainer():
         print("[EPOCH]", epoch)
         loop = tqdm(enumerate(train_dataloader), total = len(train_dataloader))
         for index, (img, poses_bounds) in loop:
+            print("[IMG]", index, "[AT TIME]", time.asctime(time.localtime(time.time())))
             poses_bounds = poses_bounds.numpy()
             poses_bounds = poses_bounds[0]
             img = img[0]
             c_to_w, height, width, focal, near, far = poses_extract(poses_bounds)
-            for ver in range(0, int(height)):
-                for hor in range(0, int(width)):
+            height = int(height) // low_res
+            width = int(width) // low_res
+            result = torch.rand(height, width, 3)
+            for ver in range(0, height):
+                print("VER: ", ver, "/", height)
+                for hor in range(0, width):
                     # For each ray
                     optimizer.zero_grad()
                     # ver: 378, hor: 504
                     C_true = img[ver, hor]
-                    #print(ver, hor)
-                    #print(img.shape)
-                    #exit(0)
                     C_coarse, C_fine = model(hor, ver, c_to_w, near, far)
                     loss = model.ray_loss(C_coarse, C_fine, C_true)
 
                     loss.backward()
                     optimizer.step()
+                    result[ver, hor] = C_fine
+
+            plt.imsave("./results/" + str(epoch) + "/" + str(index) + ".jpg", result.numpy())
 
         scheduler.step()
 
@@ -259,7 +268,22 @@ nerf.resample(t_c, s_c)
 #c = torch.tensor([[2, 3, 4], [4, 5, 6]])
 #f = torch.tensor([2, 1, 2])
 #print(torch.mul(c, f))
-
+'''
+c = torch.tensor(1.8585)
+f = torch.tensor([0.0589, 0.1179, 0.1769, 0.2358, 0.2947, 0.3538, 0.4127, 0.4716, 0.5305,
+        0.5895, 0.6485, 0.7075, 0.7666, 0.8256, 0.8847, 0.9438, 1.0027, 1.0617,
+        1.1206, 1.1796, 1.2387, 1.2976, 1.3565, 1.4155, 1.4743, 1.5333, 1.5923,
+        1.6511, 1.7100, 1.7688, 1.8278, 1.8867])
+print(torch.nonzero(f < c))
+'''
+'''
+c = torch.tensor([-0.0892, -0.0844, -0.0796, -0.0747, -0.0699, -0.0650, -0.0602, -0.0554,
+        -0.0505, -0.0457, -0.0408, -0.0360, -0.0311, -0.0263, -0.0215, -0.0166])
+f = torch.tensor([-0.0118, -0.0236, -0.0353, -0.0471, -0.0588, -0.0706, -0.0823, -0.0941])
+for k in range(0, 16):
+    print(k)
+    print(torch.nonzero(c[k] > f)[-1])
+'''
 #c = torch.rand(3, 64)
 #f = torch.rand(1, 64)
 #print(c.shape)
