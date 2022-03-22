@@ -104,8 +104,8 @@ class NeRFModel(nn.Module):
         points_wrd = torch.mm(trans_mat, torch.transpose(points_cam, 0, 1))
 
         # [[R,G,B], [R,G,B], ...]
-        color = torch.rand(num_points, 3)
-        sigma = torch.rand(num_points, 1)
+        color = torch.rand(num_points, 3).to(device)
+        sigma = torch.rand(num_points, 1).to(device)
         points_wrd = torch.transpose(points_wrd[:3, : ], 0, 1)
         dir_wrd = dir_wrd[ :3, : ].reshape(3, -1)
         # Note: Use dataloader?
@@ -129,20 +129,18 @@ class NeRFModel(nn.Module):
         # Slope of cdf is not zero, so its inverse is not infinite
         slope = sigma_coarse[1: ] / delta
         slope_inv = 1.0 / slope
-        t_inv = torch.linspace(float(low), float(high), self.num_fine + 2)
+        t_inv = torch.linspace(float(low), float(high), self.num_fine + 2).to(device)
         # Init value
         t_inv = t_inv[1:-1]
         # Row vector
-        t_fine = (torch.rand(1, self.num_fine))[0]
+        #print("DEVICE:", cdf.device)
+        #exit(0)
+        t_fine = (torch.rand(1, self.num_fine))[0].to(device)
         for i in range(0, self.num_fine):
-            # select those less than
+            # select those less than, and keep the last one (max less than)
             sel_le = torch.nonzero(t_inv[i] > cdf)
             sel_le = sel_le[-1]
             # Linear increment
-            if(sel_le >= 7):
-                print(sel_le)
-                print(t_inv)
-                print(cdf)
             t_fine[i] = t_coarse[sel_le] + (t_inv[i] - cdf[sel_le]) * slope_inv[sel_le]
 
         return t_fine
@@ -162,17 +160,18 @@ class NeRFModel(nn.Module):
     # Render a ray
     # Local coordinate: [x, y, z] = [right, up, back]
     def render_ray(self, hor, ver, trans_mat, near, far, last = 0.0001):
-        d_cam = torch.tensor([hor, ver, 1, 1]).to(torch.float64)
+        trans_mat = trans_mat.to(device)
+        d_cam = torch.tensor([hor, ver, 1, 1]).to(torch.float64).to(device)
         d_wrd = torch.mm(trans_mat, d_cam.reshape(4, -1)) # transpose to a column vector
 
-        t_coarse = torch.linspace(near, far, self.num_coarse)
+        t_coarse = torch.linspace(near, far, self.num_coarse).to(device)
         color_co, sigma_co = self.net_out(t_coarse, d_wrd, d_cam, trans_mat, self.num_coarse)
 
         t_fine = self.resample(t_coarse, sigma_co)
         color_fi, sigma_fi = self.net_out(t_fine, d_wrd, d_cam, trans_mat, self.num_fine)
 
         # Note: here t is for camara or world?
-        delta_co = torch.full((1, self.num_coarse), (far - near) / self.num_coarse)
+        delta_co = torch.full((1, self.num_coarse), (far - near) / self.num_coarse).to(device)
         # Below: (1, 192), (3, 192), (1, 192)
         t = torch.cat((t_coarse, t_fine)).unsqueeze(dim = 0) # [192] -> [1, 192]
         color = torch.cat((color_co, color_fi)).transpose(0, 1)
@@ -184,7 +183,7 @@ class NeRFModel(nn.Module):
         color = bundle[1:4].transpose(0, 1)
         sigma = bundle[4]
         # Add a tiny interval at the tail
-        delta = torch.cat((t[1: ] - t[ :-1], torch.tensor([last])))
+        delta = torch.cat((t[1: ] - t[ :-1], torch.tensor([last]).to(device)))
 
         # Transform into row vectors
         delta_co = delta_co[0]
@@ -233,7 +232,7 @@ def NeRF_trainer():
             print("[IMG]", index, "[AT TIME]", time.asctime(time.localtime(time.time())))
             poses_bounds = poses_bounds.numpy()
             poses_bounds = poses_bounds[0]
-            img = img[0]
+            img = img[0].to(device)
             c_to_w, height, width, focal, near, far = poses_extract(poses_bounds)
             height = int(height) // low_res
             width = int(width) // low_res
@@ -252,7 +251,8 @@ def NeRF_trainer():
                     optimizer.step()
                     result[ver, hor] = C_fine
 
-            plt.imsave("./results/" + str(epoch) + "/" + str(index) + ".jpg", result.numpy())
+                if(((ver % 10) == 0) or (ver == height - 1)):
+                    plt.imsave("./results/" + str(epoch) + "/" + str(index) + ".jpg", result.detach().numpy())
 
         scheduler.step()
 
