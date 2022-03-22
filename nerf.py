@@ -1,5 +1,7 @@
+from cmath import sin
 import math
 import time
+from tracemalloc import start
 from unicodedata import name
 import numpy as np
 import torch
@@ -56,28 +58,38 @@ class Network(nn.Module):
         return out
 
 class Encoder(nn.Module):
-    def __init__(self, L_point = 10, L_dir = 4):
+    def __init__(self, L_point = 10, L_dir = 4, batch_size = 8):
         super(Encoder, self).__init__()
         self.L_point = L_point
         self.L_dir = L_dir
+        self.batch_size = batch_size
 
+    # Point shape as [[x, y, z], [x, y, z], ... * BATCH, [x, y, z]]
+    # (N_batch, 3)
     def forward(self, point, dir):
         #x, y, z = point
         #p, q, r = dir
 
         # Encoder for [x, y, z]
-        gamma_point = torch.rand(2 * self.L_point, 3)
-        # [[sin x, sin y, sin z], [cos x, cos y, cos z], ...]
-        for l in range(0, 2 * self.L_point, 2):
-            angle = torch.mul(2 ** l * math.pi, point)
-            gamma_point[l] = torch.sin(angle)
-            gamma_point[l + 1] = torch.cos(angle)
+        gamma_point = torch.rand(1, self.L_point, 1, 1)
+        gamma_point[0, : , 0, 0] = torch.range(0, self.L_point - 1, 1)
+        # Get 2^l * pi
+        gamma_point = torch.exp2(gamma_point) * math.pi
 
-        gamma_point = gamma_point.permute(1, 0)
-        # [[sin x, cos x, sin 2x, cos 2x, ...], [sin y, cos y, ...], [sin z, ...]]
+        # (N_batch, L, N_channel, 2 (sin, cos))
+        gamma_point = gamma_point.repeat(self.batch_size, 1, 3, 2)
+        # unsqueeze + repeat: (N_batch, N_channel) -> (N_batch, L, N_channel, 2)
+        gamma_point = torch.mul(gamma_point, point.unsqueeze(1).unsqueeze(-1).repeat(1, self.L_point, 1, 2))
+        # [[[[sin x, cos x], [sin y, cos y], [sin z, cos z]], ... * L], ... * BATCH]
+        # (N_batch, L, N_channel, 2) -> (N_batch, L, N_channel) -> (N_batch, L, N_channel, 1)
+        gamma_point_sin = torch.sin(gamma_point[ : , : , : , 0]).unsqueeze(-1)
+        gamma_point_cos = torch.cos(gamma_point[ : , : , : , 1]).unsqueeze(-1)
+        # (N_batch, L, N_channel, 1) -> (N_batch, L, N_channel, 2) -> (N_batch, N_channel, L, 2) -> (N_batch, N_channel, L+L)
+        gamma_point = torch.cat((gamma_point_sin, gamma_point_cos), dim = -1).permute(0, 2, 1, 3).flatten(start_dim = 2, end_dim = 3)
+        # [[[sin x, cos x, sin 2x, cos 2x, ...], [sin y, cos y, ...], [sin z, ...]], ... * batch]
 
         # Encoder for [p, q, r]
-        gamma_dir = torch.rand(2 * self.L_dir, 3)
+        gamma_dir = torch.rand(1, self.L_dir, 1, 1)
         dir = dir.reshape(-1, 3)
         dir = dir[0] # transform into a row vector
         for l in range(0, 2 * self.L_dir, 2):
@@ -97,6 +109,7 @@ class NeRFModel(nn.Module):
         self.network = Network()
         self.num_coarse = num_coarse
         self.num_fine = num_fine
+        self.batch_ray = batch_ray
 
     def net_out(self, t_array, dir_wrd, dir_cam, trans_mat, num_points):
         # Notice: homogeneous coordinates here!
@@ -113,8 +126,9 @@ class NeRFModel(nn.Module):
         dir_wrd = dir_wrd[ :3, : ].reshape(3, -1)
         # Note: Use dataloader?
         for i in range(0, num_points):
-            point_enc, dir_enc = self.encoder.forward(points_wrd[i], dir_wrd)
-            color[i], sigma[i] = self.network.forward(point_enc, dir_enc)
+            #point_enc, dir_enc = self.encoder.forward(points_wrd[i], dir_wrd)
+            #color[i], sigma[i] = self.network.forward(point_enc, dir_enc)
+            point_enc, dir_enc = self.encoder.forward(torch.full((self.batch_ray, 3), 0.1), torch.full((self.batch_ray, 3), 0.2))
 
         # Notice: these two are column vectors: (192, 3), (192, 1)
         return color, sigma
@@ -301,6 +315,36 @@ for k in range(0, 16):
 #print(c.shape)
 #print(f.shape)
 #print(torch.mul(c, f))
+'''
+def test():
+    x = np.arange(0, 6, 1)
+    y = np.arange(0, 3, 1)
+    xx, yy = np.meshgrid(x, y, indexing = 'xy')
+    xx = xx.flatten()
+    yy = yy.flatten()
+    print(xx)
+    print(yy)
+'''
+
+def test():
+    m = torch.tensor([[[1, -1],
+                    [1, -1],
+                    [1, -1]],
+                  [[2, -2],
+                    [2, -2],
+                    [2, -2]],
+                  [[3, -3],
+                    [3, -3],
+                    [3, -3]],
+                  [[4, -4],
+                    [4, -4],
+                    [4, -4]],
+                  [[5, -5],
+                    [5, -5],
+                    [5, -5]]])
+    # (5, 3, 2) -> (3, 5+5)
+    print(m.permute(1, 0, 2).flatten(start_dim = 1, end_dim = 2))
 
 if __name__ == "__main__":
     NeRF_trainer()
+    #test()
