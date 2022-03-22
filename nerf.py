@@ -70,34 +70,30 @@ class Encoder(nn.Module):
         #x, y, z = point
         #p, q, r = dir
 
-        # Encoder for [x, y, z]
-        gamma_point = torch.rand(1, self.L_point, 1, 1)
-        gamma_point[0, : , 0, 0] = torch.range(0, self.L_point - 1, 1)
+        # Encoder for [x, y, z] and [p, q, r] bundle
+        gamma_bundle = torch.rand(1, self.L_point + self.L_dir, 1, 1)
+        gamma_bundle[0, : self.L_point, 0, 0] = torch.range(0, self.L_point - 1, 1)
+        gamma_bundle[0, self.L_point: , 0, 0] = torch.range(0, self.L_dir - 1, 1)
         # Get 2^l * pi
-        gamma_point = torch.exp2(gamma_point) * math.pi
+        gamma_bundle = torch.exp2(gamma_bundle) * math.pi
 
         # (N_batch, L, N_channel, 2 (sin, cos))
-        gamma_point = gamma_point.repeat(self.batch_size, 1, 3, 2)
-        # unsqueeze + repeat: (N_batch, N_channel) -> (N_batch, L, N_channel, 2)
-        gamma_point = torch.mul(gamma_point, point.unsqueeze(1).unsqueeze(-1).repeat(1, self.L_point, 1, 2))
+        gamma_bundle = gamma_bundle.repeat(self.batch_size, 1, 3, 2)
+        # unsqueeze + repeat: (N_batch, N_channel) -> (N_batch, L1+L2, N_channel, 2)
+        point_bundle = point.unsqueeze(1).unsqueeze(-1).repeat(1, self.L_point, 1, 2)
+        dir_bundle = dir.unsqueeze(1).unsqueeze(-1).repeat(1, self.L_dir, 1, 2)
+        bundle = torch.cat((point_bundle, dir_bundle), dim = 1)
+        gamma_bundle = torch.mul(gamma_bundle, bundle)
         # [[[[sin x, cos x], [sin y, cos y], [sin z, cos z]], ... * L], ... * BATCH]
         # (N_batch, L, N_channel, 2) -> (N_batch, L, N_channel) -> (N_batch, L, N_channel, 1)
-        gamma_point_sin = torch.sin(gamma_point[ : , : , : , 0]).unsqueeze(-1)
-        gamma_point_cos = torch.cos(gamma_point[ : , : , : , 1]).unsqueeze(-1)
+        gamma_bundle_sin = torch.sin(gamma_bundle[ : , : , : , 0]).unsqueeze(-1)
+        gamma_bundle_cos = torch.cos(gamma_bundle[ : , : , : , 1]).unsqueeze(-1)
         # (N_batch, L, N_channel, 1) -> (N_batch, L, N_channel, 2) -> (N_batch, N_channel, L, 2) -> (N_batch, N_channel, L+L)
-        gamma_point = torch.cat((gamma_point_sin, gamma_point_cos), dim = -1).permute(0, 2, 1, 3).flatten(start_dim = 2, end_dim = 3)
+        gamma_bundle = torch.cat((gamma_bundle_sin, gamma_bundle_cos), dim = -1).permute(0, 2, 1, 3).flatten(start_dim = 2, end_dim = 3)
         # [[[sin x, cos x, sin 2x, cos 2x, ...], [sin y, cos y, ...], [sin z, ...]], ... * batch]
 
-        # Encoder for [p, q, r]
-        gamma_dir = torch.rand(1, self.L_dir, 1, 1)
-        dir = dir.reshape(-1, 3)
-        dir = dir[0] # transform into a row vector
-        for l in range(0, 2 * self.L_dir, 2):
-            angle = torch.mul(2 ** l * math.pi, dir)
-            gamma_dir[l] = torch.sin(angle)
-            gamma_dir[l + 1] = torch.cos(angle)
-
-        gamma_dir = gamma_dir.permute(1, 0)
+        gamma_point = gamma_bundle[ : , : , : 2 * self.L_point]
+        gamma_dir = gamma_bundle[ : , : , 2 * self.L_point : ]
         gamma = (gamma_point, gamma_dir)
 
         return gamma
