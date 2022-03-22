@@ -29,11 +29,12 @@ print("Using device", device)
 first = 0
 
 class Network(nn.Module):
-    def __init__(self, point_dim = 60, dir_dim = 24, depth = 8, width = 256, batch_size = 8):
+    def __init__(self, num_points, point_dim = 60, dir_dim = 24, depth = 8, width = 256, batch_size = 8):
         super(Network, self).__init__()
         self.depth = depth
         self.width = width
         self.batch_size = batch_size
+        self.num_points = num_points
 
         # Build layers for space coordinates
         point_layer = torch.nn.Sequential(torch.nn.Linear(point_dim, width), torch.nn.ReLU(True))
@@ -47,17 +48,14 @@ class Network(nn.Module):
         self.color_layer = torch.nn.Sequential(torch.nn.Linear(width + dir_dim, 3), torch.nn.Sigmoid())
 
     def forward(self, point, dir):
-        # Shape as [N_batch, L+L, N_channel]
-        point_long_vec = torch.flatten(point, start_dim = 1)
-        dir_long_vec = torch.flatten(dir, start_dim = 1)
+        # Shape as (N_batch, N_points, L+L, N_channel)
+        point_long_vec = torch.flatten(point, start_dim = 2)
+        dir_long_vec = torch.flatten(dir, start_dim = 2)
     
         point_out = self.point_layer(point_long_vec)
         sigma_out = self.sigma_layer(point_out)
         color_in  = torch.cat((dir_long_vec, point_out), dim = -1)
         color_out = self.color_layer(color_in)
-        #print(color_out)
-        #print(sigma_out)
-        #exit(0)
         out = (color_out, sigma_out)
 
         return out
@@ -113,13 +111,14 @@ class NeRFModel(nn.Module):
     def __init__(self, num_coarse = 64, num_fine = 128, batch_ray = 8):
         super(NeRFModel, self).__init__()
         self.encoder = Encoder(num_points = 2, batch_size = batch_ray)
-        self.network = Network(batch_size = batch_ray)
+        self.network = Network(num_points = 2, batch_size = batch_ray)
         self.num_coarse = num_coarse
         self.num_fine = num_fine
         self.batch_ray = batch_ray
 
     def net_out(self, t_array, dir_wrd, dir_cam, trans_mat, num_points):
         # Notice: homogeneous coordinates here!
+        # t_array: shape as (N_points, N_batch)
         points_cam = dir_cam.repeat(num_points, 1)
         # Revise Column 2
         points_cam[torch.arange(0, num_points).long(), 2] = t_array.reshape(-1, num_points).double()
@@ -135,8 +134,8 @@ class NeRFModel(nn.Module):
         for i in range(0, num_points):
             #point_enc, dir_enc = self.encoder.forward(points_wrd[i], dir_wrd)
             #color[i], sigma[i] = self.network.forward(point_enc, dir_enc)
-            point_enc, dir_enc = self.encoder.forward(torch.full((self.batch_ray, 2, 3), 0.1).to(device), torch.full((self.batch_ray, 2, 3), 0.2).to(device))
-            #c, s = self.network.forward(torch.full((self.batch_ray, 2, 3, 20), 0.1).to(device), torch.full((self.batch_ray, 2, 3, 8), 0.2).to(device))
+            #point_enc, dir_enc = self.encoder.forward(torch.full((self.batch_ray, 2, 3), 0.1).to(device), torch.full((self.batch_ray, 2, 3), 0.2).to(device))
+            c, s = self.network.forward(torch.full((self.batch_ray, 2, 3, 20), 0.1).to(device), torch.full((self.batch_ray, 2, 3, 8), 0.2).to(device))
 
         # Notice: these two are column vectors: (192, 3), (192, 1)
         return color, sigma
