@@ -1,5 +1,6 @@
 import math
 import time
+from unicodedata import name
 import numpy as np
 import torch
 import torch.nn as nn
@@ -22,6 +23,8 @@ torch.backends.cudnn.benchmark = False
 
 device = torch.device("cpu") if not torch.cuda.is_available() else torch.device("cuda:0")
 print("Using device", device)
+
+first = 0
 
 class Network(nn.Module):
     def __init__(self, point_dim = 60, dir_dim = 24, depth = 8, width = 256):
@@ -88,7 +91,7 @@ class Encoder(nn.Module):
         return gamma
 
 class NeRFModel(nn.Module):
-    def __init__(self, num_coarse = 64, num_fine = 128):
+    def __init__(self, num_coarse = 64, num_fine = 128, batch_ray = 8):
         super(NeRFModel, self).__init__()
         self.encoder = Encoder()
         self.network = Network()
@@ -204,9 +207,12 @@ class NeRFModel(nn.Module):
         # Note: ignore batch here
         return self.render_ray(hor, -ver, trans_mat, near, far)
 
-img_dir = "../nerf_llff_data/fern/"
-low_res = 8
+
+IMG_DIR = "../nerf_llff_data/fern/"
+LOW_RES = 8
 EPOCH = 10000
+BATCH_RAY = 8
+BATCH_PIC = 1
 
 def poses_extract(pb_matrix):
     pose = pb_matrix[ :-2].reshape(3, 5)
@@ -218,9 +224,9 @@ def poses_extract(pb_matrix):
     return c_to_w, height, width, focal, near, far
 
 def NeRF_trainer():
-    model = NeRFModel(num_coarse = 8, num_fine = 16)
-    train_dataset = loader.NeRFDataset(root_dir = img_dir + "images_8/", transform = None)
-    train_dataloader = DataLoader(dataset = train_dataset, shuffle = True)
+    model = NeRFModel(num_coarse = 8, num_fine = 16, batch_ray = BATCH_RAY).to(device)
+    train_dataset = loader.NeRFDataset(root_dir = IMG_DIR, low_res = LOW_RES, transform = None)
+    train_dataloader = DataLoader(dataset = train_dataset, batch_size = BATCH_PIC, shuffle = True, num_workers = 2)
 
     optimizer = torch.optim.Adam(model.parameters(), lr = 5e-4, betas = (0.9, 0.999), eps = 1e-7)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma = 0.1)
@@ -232,19 +238,25 @@ def NeRF_trainer():
             print("[IMG]", index, "[AT TIME]", time.asctime(time.localtime(time.time())))
             poses_bounds = poses_bounds.numpy()
             poses_bounds = poses_bounds[0]
+            #print(img.shape)
+            #exit(0)
+            # [PIC, HEIGHT, WIDTH, CHANNEL]
             img = img[0].to(device)
             c_to_w, height, width, focal, near, far = poses_extract(poses_bounds)
-            height = int(height) // low_res
-            width = int(width) // low_res
+            height = int(height) // LOW_RES
+            width = int(width) // LOW_RES
             result = torch.rand(height, width, 3)
+            #print("NEAR:", near)
             for ver in range(0, height):
                 print("VER: ", ver, "/", height)
                 for hor in range(0, width):
                     # For each ray
                     optimizer.zero_grad()
                     # ver: 378, hor: 504
+                    # [BATCH, 3]
                     C_true = img[ver, hor]
                     C_coarse, C_fine = model(hor, ver, c_to_w, near, far)
+                    print(C_coarse.shape)
                     loss = model.ray_loss(C_coarse, C_fine, C_true)
 
                     loss.backward()
@@ -290,4 +302,5 @@ for k in range(0, 16):
 #print(f.shape)
 #print(torch.mul(c, f))
 
-NeRF_trainer()
+if __name__ == "__main__":
+    NeRF_trainer()
