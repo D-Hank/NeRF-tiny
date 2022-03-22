@@ -1,8 +1,5 @@
-from cmath import sin
 import math
 import time
-from tracemalloc import start
-from unicodedata import name
 import numpy as np
 import torch
 import torch.nn as nn
@@ -118,12 +115,22 @@ class NeRFModel(nn.Module):
 
     def net_out(self, t_array, dir_wrd, dir_cam, trans_mat, num_points):
         # Notice: homogeneous coordinates here!
-        # t_array: shape as (N_points, N_batch)
-        points_cam = dir_cam.repeat(num_points, 1)
-        # Revise Column 2
-        points_cam[torch.arange(0, num_points).long(), 2] = t_array.reshape(-1, num_points).double()
+        # t_array: shape as (N_batch, N_points)
+        # dir_cam: shape as (N_batch, 4)
+        # points_cam: shape as (N_batch, N_points, 4)
+        #print(t_array)
+        #print(dir_cam)
+        points_cam = dir_cam.unsqueeze(1).repeat(1, num_points, 1)
+        # Revise Column z coordinate
+        # (4, N_batch, N_points)
+        points_cam = points_cam.permute(2, 0, 1)
+        points_cam[2, : , : ] = t_array.double()
         # [[x, y, z, 1], [x, y, z, 1], ...], points in batch
-        points_wrd = torch.mm(trans_mat, torch.transpose(points_cam, 0, 1))
+        # Broadcast multiplication: (N_batch, N_points, 4) * (4, 4) -> (N_batch, N_points, 4)
+        points_wrd = torch.matmul(points_cam.permute(1, 2, 0), trans_mat.transpose(0, 1))
+        print(points_wrd[5, 0])
+        print(torch.mm(trans_mat, torch.tensor([1, -1, 18.0587, 1]).unsqueeze(1).to(torch.double).to(device)))
+        exit(0)
 
         # [[R,G,B], [R,G,B], ...]
         color = torch.rand(num_points, 3).to(device)
@@ -181,14 +188,16 @@ class NeRFModel(nn.Module):
 
         return torch.sum(term, dim = 1)
 
-    # Render a ray
+    # Render a ray batch (drop last batch)
     # Local coordinate: [x, y, z] = [right, up, back]
-    def render_ray(self, hor, ver, trans_mat, near, far, last = 0.0001):
-        trans_mat = trans_mat.to(device)
-        d_cam = torch.tensor([hor, ver, 1, 1]).to(torch.float64).to(device)
-        d_wrd = torch.mm(trans_mat, d_cam.reshape(4, -1)) # transpose to a column vector
+    def render_rays(self, batch_ver, batch_hor, trans_mat, near, far, last = 0.0001):
+        # (x, -y, -1, 1) * N_batch
+        d_cam = torch.cat((batch_hor.unsqueeze(1), -batch_ver.unsqueeze(1), -torch.ones(8, 1).to(device), torch.ones(8, 1).to(device)), dim = 1).to(torch.float64)
+        # transpose to a column vector: (4, N_batch)
+        d_wrd = torch.mm(trans_mat, d_cam.reshape(4, -1))
 
-        t_coarse = torch.linspace(near, far, self.num_coarse).to(device)
+        # Shape as (N_batch, N_points)
+        t_coarse = torch.linspace(near, far, self.num_coarse).to(device).unsqueeze(0).repeat(self.batch_ray, 1)
         color_co, sigma_co = self.net_out(t_coarse, d_wrd, d_cam, trans_mat, self.num_coarse)
 
         t_fine = self.resample(t_coarse, sigma_co)
@@ -226,13 +235,16 @@ class NeRFModel(nn.Module):
     def forward(self, hor, ver, trans_mat, near, far):
         # In picture: [x, y] = [right, down]
         # Note: ignore batch here
-        return self.render_ray(hor, -ver, trans_mat, near, far)
+        trans_mat = trans_mat.to(device)
+        batch_y = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1]).to(device)
+        batch_x = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3]).to(device)
+        return self.render_rays(batch_y, batch_x, trans_mat, near, far)
 
 
 IMG_DIR = "../nerf_llff_data/fern/"
 LOW_RES = 8
 EPOCH = 10000
-BATCH_RAY = 4
+BATCH_RAY = 8
 BATCH_PIC = 1
 
 def poses_extract(pb_matrix):
@@ -245,7 +257,7 @@ def poses_extract(pb_matrix):
     return c_to_w, height, width, focal, near, far
 
 def NeRF_trainer():
-    model = NeRFModel(num_coarse = 8, num_fine = 16, batch_ray = BATCH_RAY).to(device)
+    model = NeRFModel(num_coarse = 4, num_fine = 16, batch_ray = BATCH_RAY).to(device)
     train_dataset = loader.NeRFDataset(root_dir = IMG_DIR, low_res = LOW_RES, transform = None)
     train_dataloader = DataLoader(dataset = train_dataset, batch_size = BATCH_PIC, shuffle = True, num_workers = 2)
 
@@ -332,7 +344,7 @@ def test():
     print(xx)
     print(yy)
 '''
-
+'''
 def test():
     m = torch.tensor([[[1, -1],
                     [1, -1],
@@ -351,6 +363,12 @@ def test():
                     [5, -5]]])
     # (5, 3, 2) -> (3, 5+5)
     print(m.permute(1, 0, 2).flatten(start_dim = 1, end_dim = 2))
+'''
+
+def test():
+    m = torch.rand(8, 5, 4)
+    n = torch.rand(4, 6)
+    print(torch.matmul(m, n))
 
 if __name__ == "__main__":
     NeRF_trainer()
