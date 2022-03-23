@@ -26,12 +26,11 @@ print("Using device", device)
 first = 0
 
 class Network(nn.Module):
-    def __init__(self, num_points, point_dim = 60, dir_dim = 24, depth = 8, width = 256, batch_size = 8):
+    def __init__(self, point_dim = 60, dir_dim = 24, depth = 8, width = 256, batch_size = 8):
         super(Network, self).__init__()
         self.depth = depth
         self.width = width
         self.batch_size = batch_size
-        self.num_points = num_points
 
         # Build layers for space coordinates
         point_layer = torch.nn.Sequential(torch.nn.Linear(point_dim, width), torch.nn.ReLU(True))
@@ -44,7 +43,7 @@ class Network(nn.Module):
         # Build layers for direction coordinates
         self.color_layer = torch.nn.Sequential(torch.nn.Linear(width + dir_dim, 3), torch.nn.Sigmoid())
 
-    def forward(self, point, dir):
+    def forward(self, num_points, point, dir):
         # Shape as (N_batch, N_points, L+L, N_channel)
         point_long_vec = torch.flatten(point, start_dim = 2)
         dir_long_vec = torch.flatten(dir, start_dim = 2)
@@ -53,24 +52,25 @@ class Network(nn.Module):
         sigma_out = self.sigma_layer(point_out)
         color_in  = torch.cat((dir_long_vec, point_out), dim = -1)
         color_out = self.color_layer(color_in)
+        # (N_batch, N_point, 3)
+        # (N_batch, N_point, 1)
         out = (color_out, sigma_out)
 
         return out
 
 class Encoder(nn.Module):
-    def __init__(self, num_points, L_point = 10, L_dir = 4, batch_size = 8):
+    def __init__(self, L_point = 10, L_dir = 4, batch_size = 8):
         super(Encoder, self).__init__()
         self.L_point = L_point
         self.L_dir = L_dir
         self.batch_size = batch_size
-        # Number of points for each ray
-        self.num_points = num_points
 
     # Point shape as [[[x, y, z], [x, y, z], ... * POINTS], ... * BATCH]
     # (N_batch, N_point, 3)
-    def forward(self, point, dir):
-        #x, y, z = point
-        #p, q, r = dir
+    def forward(self, num_points, point, dir):
+        # num_points: Number of points for each ray
+        # x, y, z = point
+        # p, q, r = dir
 
         # Encoder for [x, y, z] and [p, q, r] bundle
         gamma_bundle = torch.rand(1, 1, self.L_point + self.L_dir, 1, 1).to(device)
@@ -80,7 +80,7 @@ class Encoder(nn.Module):
         gamma_bundle = torch.exp2(gamma_bundle) * math.pi
 
         # (N_batch, N_points, L, N_channel, 2 (sin, cos))
-        gamma_bundle = gamma_bundle.repeat(self.batch_size, self.num_points, 1, 3, 2)
+        gamma_bundle = gamma_bundle.repeat(self.batch_size, num_points, 1, 3, 2)
         # unsqueeze + repeat: (N_batch, N_points, N_channel) -> (N_batch, N_points, L1+L2, N_channel, 2)
         point_bundle = point.unsqueeze(2).unsqueeze(-1).repeat(1, 1, self.L_point, 1, 2)
         dir_bundle = dir.unsqueeze(2).unsqueeze(-1).repeat(1, 1, self.L_dir, 1, 2)
@@ -107,65 +107,69 @@ class Encoder(nn.Module):
 class NeRFModel(nn.Module):
     def __init__(self, num_coarse = 64, num_fine = 128, batch_ray = 8):
         super(NeRFModel, self).__init__()
-        self.encoder = Encoder(num_points = 2, batch_size = batch_ray)
-        self.network = Network(num_points = 2, batch_size = batch_ray)
+        self.encoder = Encoder(batch_size = batch_ray)
+        self.network = Network(batch_size = batch_ray)
         self.num_coarse = num_coarse
         self.num_fine = num_fine
         self.batch_ray = batch_ray
 
-    def net_out(self, t_array, dir_wrd, dir_cam, trans_mat, num_points):
+    def net_out(self, t_array, batch_x, batch_y, trans_mat, num_points):
         # Notice: homogeneous coordinates here!
         # t_array: shape as (N_batch, N_points)
-        # dir_cam: shape as (N_batch, 4)
-        # points_cam: shape as (N_batch, N_points, 4)
-        #print(t_array)
-        #print(dir_cam)
-        points_cam = dir_cam.unsqueeze(1).repeat(1, num_points, 1)
+        # batch_x: shape as (N_batch)
+        # xy_hom: shape as (4, N_batch)
+        xy_hom = torch.cat((
+            batch_x.unsqueeze(0),
+            batch_y.unsqueeze(0),
+            torch.zeros(1, self.batch_ray).to(device),
+            torch.ones(1, self.batch_ray).to(device)), dim = 0)
         # Revise Column z coordinate
         # (4, N_batch, N_points)
-        points_cam = points_cam.permute(2, 0, 1)
-        points_cam[2, : , : ] = t_array.double()
+        points_cam = xy_hom.unsqueeze(2).repeat(1, 1, num_points)
+        points_cam[2, : , : ] = t_array
+        # (4, 1), column vector
+        dir_cam = torch.tensor([0.0, 0.0, -1.0, 1.0]).reshape(4, -1).to(device)
         # [[x, y, z, 1], [x, y, z, 1], ...], points in batch
         # Broadcast multiplication: (N_batch, N_points, 4) * (4, 4) -> (N_batch, N_points, 4)
         points_wrd = torch.matmul(points_cam.permute(1, 2, 0), trans_mat.transpose(0, 1))
-        print(points_wrd[5, 0])
-        print(torch.mm(trans_mat, torch.tensor([1, -1, 18.0587, 1]).unsqueeze(1).to(torch.double).to(device)))
-        exit(0)
+        # (4, 1)
+        dir_wrd = torch.mm(trans_mat, dir_cam)
 
-        # [[R,G,B], [R,G,B], ...]
-        color = torch.rand(num_points, 3).to(device)
-        sigma = torch.rand(num_points, 1).to(device)
-        points_wrd = torch.transpose(points_wrd[:3, : ], 0, 1)
-        dir_wrd = dir_wrd[ :3, : ].reshape(3, -1)
-        # Note: Use dataloader?
-        for i in range(0, num_points):
-            #point_enc, dir_enc = self.encoder.forward(points_wrd[i], dir_wrd)
-            #color[i], sigma[i] = self.network.forward(point_enc, dir_enc)
-            #point_enc, dir_enc = self.encoder.forward(torch.full((self.batch_ray, 2, 3), 0.1).to(device), torch.full((self.batch_ray, 2, 3), 0.2).to(device))
-            c, s = self.network.forward(torch.full((self.batch_ray, 2, 3, 20), 0.1).to(device), torch.full((self.batch_ray, 2, 3, 8), 0.2).to(device))
+        # [[[R,G,B], [R,G,B], ... * points], ... * batch]
+        # (N_batch, N_points, 3)
+        points_wrd = points_wrd[ : , : , :3]
+        # (3, 1) -> (1, 3) -> (1, 1, 3) -> (N, N, 3)
+        dir_wrd = dir_wrd[ :3, : ].transpose(0, 1).unsqueeze(1).repeat(self.batch_ray, num_points, 1)
 
-        # Notice: these two are column vectors: (192, 3), (192, 1)
+        point_enc, dir_enc = self.encoder.forward(num_points, points_wrd, dir_wrd)
+        color, sigma = self.network.forward(num_points,point_enc, dir_enc)
+
+        # output shape: (N_batch, N_points, channel=3/1)
         return color, sigma
 
     # Get cdf of coarse sampling, then with its reverse, we use uniform sampling along the horizontal axis
     def resample(self, t_coarse, sigma_coarse):
-        # Transform column vector into row one
-        sigma_coarse = torch.transpose(sigma_coarse, 0, 1)
-        sigma_coarse = sigma_coarse[0]
+        # t_coarse: (N_batch, N_points)
+        # sigma_coarse: (N_batch, N_points, 1)
 
-        cdf = torch.cumsum(sigma_coarse, dim = 0)
-        high = max(cdf)
-        low = min(cdf)
-        delta = t_coarse[1] - t_coarse[0]
+        # (N_batch, N_points)
+        cdf = torch.cumsum(sigma_coarse, dim = 1).squeeze()
+        # drop indices
+        # shape: (N_batch)
+        high, _ = torch.max(cdf, dim = 1)
+        low, _ = torch.min(cdf, dim = 1)
+        delta = t_coarse[0, 1] - t_coarse[0, 0]
         # Slope of cdf is not zero, so its inverse is not infinite
         slope = sigma_coarse[1: ] / delta
         slope_inv = 1.0 / slope
-        t_inv = torch.linspace(float(low), float(high), self.num_fine + 2).to(device)
-        # Init value
-        t_inv = t_inv[1:-1]
-        # Row vector
-        #print("DEVICE:", cdf.device)
-        #exit(0)
+        high = high.detach().cpu().numpy()
+        low = low.detach().cpu().numpy()
+        # (N_fine+2, N_batch)
+        t_inv = np.linspace(tuple(low), tuple(high), self.num_fine + 2)
+        # Init value, drop start and end
+        # (N_batch, N_fine)
+        t_inv = torch.tensor(t_inv[1:-1]).transpose(0, 1)
+
         t_fine = (torch.rand(1, self.num_fine))[0].to(device)
         for i in range(0, self.num_fine):
             # select those less than, and keep the last one (max less than)
@@ -190,18 +194,14 @@ class NeRFModel(nn.Module):
 
     # Render a ray batch (drop last batch)
     # Local coordinate: [x, y, z] = [right, up, back]
-    def render_rays(self, batch_ver, batch_hor, trans_mat, near, far, last = 0.0001):
-        # (x, -y, -1, 1) * N_batch
-        d_cam = torch.cat((batch_hor.unsqueeze(1), -batch_ver.unsqueeze(1), -torch.ones(8, 1).to(device), torch.ones(8, 1).to(device)), dim = 1).to(torch.float64)
-        # transpose to a column vector: (4, N_batch)
-        d_wrd = torch.mm(trans_mat, d_cam.reshape(4, -1))
-
+    # Notice: some redundant calculation here!
+    def render_rays(self, batch_hor, batch_ver, trans_mat, near, far, last = 0.0001):
         # Shape as (N_batch, N_points)
         t_coarse = torch.linspace(near, far, self.num_coarse).to(device).unsqueeze(0).repeat(self.batch_ray, 1)
-        color_co, sigma_co = self.net_out(t_coarse, d_wrd, d_cam, trans_mat, self.num_coarse)
+        color_co, sigma_co = self.net_out(t_coarse, batch_hor, -batch_ver, trans_mat, self.num_coarse)
 
         t_fine = self.resample(t_coarse, sigma_co)
-        color_fi, sigma_fi = self.net_out(t_fine, d_wrd, d_cam, trans_mat, self.num_fine)
+        color_fi, sigma_fi = self.net_out(t_fine, batch_hor, -batch_ver, trans_mat, self.num_fine)
 
         # Note: here t is for camara or world?
         delta_co = torch.full((1, self.num_coarse), (far - near) / self.num_coarse).to(device)
@@ -238,7 +238,7 @@ class NeRFModel(nn.Module):
         trans_mat = trans_mat.to(device)
         batch_y = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1]).to(device)
         batch_x = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3]).to(device)
-        return self.render_rays(batch_y, batch_x, trans_mat, near, far)
+        return self.render_rays(batch_x, batch_y, trans_mat, near, far)
 
 
 IMG_DIR = "../nerf_llff_data/fern/"
@@ -249,7 +249,7 @@ BATCH_PIC = 1
 
 def poses_extract(pb_matrix):
     pose = pb_matrix[ :-2].reshape(3, 5)
-    c_to_w = torch.tensor(pose[ : , :-1])
+    c_to_w = torch.tensor(pose[ : , :-1]).to(torch.float)
     hwf = pose[ : , -1]
     height, width, focal = hwf
     near, far = pb_matrix[-2: ]
@@ -257,7 +257,7 @@ def poses_extract(pb_matrix):
     return c_to_w, height, width, focal, near, far
 
 def NeRF_trainer():
-    model = NeRFModel(num_coarse = 4, num_fine = 16, batch_ray = BATCH_RAY).to(device)
+    model = NeRFModel(num_coarse = 4, num_fine = 4, batch_ray = BATCH_RAY).to(device)
     train_dataset = loader.NeRFDataset(root_dir = IMG_DIR, low_res = LOW_RES, transform = None)
     train_dataloader = DataLoader(dataset = train_dataset, batch_size = BATCH_PIC, shuffle = True, num_workers = 2)
 
@@ -366,9 +366,9 @@ def test():
 '''
 
 def test():
-    m = torch.rand(8, 5, 4)
-    n = torch.rand(4, 6)
-    print(torch.matmul(m, n))
+    m = torch.tensor([1, 2, 3]).reshape(1, 3)
+    n = torch.tensor([10, 9, 8]).reshape(1, 3)
+    print(np.linspace(tuple(m.numpy()), tuple(n.numpy()), 5))
 
 if __name__ == "__main__":
     NeRF_trainer()
