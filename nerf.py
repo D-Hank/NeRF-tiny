@@ -172,31 +172,27 @@ class NeRFModel(nn.Module):
         # indices of t_inv when inserted in cdf
         index_fine = torch.searchsorted(cdf, t_inv) - 1
 
-        print(t_coarse.shape)
-        print(index_fine.shape)
-        print(slope_inv.shape)
         lower_t = torch.gather(t_coarse, dim = 1, index = index_fine)
         lower_cdf = torch.gather(cdf, dim = 1, index = index_fine)
         # Add an extra column to fit the function, but we will not use it then
         lower_slope = torch.gather(torch.cat((slope_inv, torch.zeros(self.batch_ray, 1).to(device)), dim = 1), dim = 1, index = index_fine)
         t_fine = lower_t + (t_inv - lower_cdf) * lower_slope
-        print(t_coarse)
-        print(t_fine)
-        exit(0)
 
         return t_fine
 
     def color_cum(self, delta, sigma, color):
+        # delta: (N_batch, N_points)
+        # sigma: (N_batch, N_points)
+        # color: (N_batch, N_points, 3)
         sigma_delta = torch.mul(delta, sigma)
-        sum_sd = torch.cumsum(sigma_delta, dim = 0)
+        sum_sd = torch.cumsum(sigma_delta, dim = 1)
         T = torch.exp(-sum_sd)
-        t_exp = torch.mul(T, 1 - torch.exp(-sigma_delta))
-        color = color.transpose(0, 1)
-        # Transform into 2 dimensions
-        t_exp = t_exp.unsqueeze(0)
+        # (N_batch, N_points) -> (N_batch, N_points, 1)
+        t_exp = torch.mul(T, 1 - torch.exp(-sigma_delta)).unsqueeze(2)
         term = torch.mul(color, t_exp)
+        result = torch.sum(term, dim = 1)
 
-        return torch.sum(term, dim = 1)
+        return result
 
     # Render a ray batch (drop last batch)
     # Local coordinate: [x, y, z] = [right, up, back]
@@ -206,29 +202,33 @@ class NeRFModel(nn.Module):
         t_coarse = torch.linspace(near, far, self.num_coarse).to(device).unsqueeze(0).repeat(self.batch_ray, 1)
         color_co, sigma_co = self.net_out(t_coarse, batch_hor, -batch_ver, trans_mat, self.num_coarse)
 
+        # Shape as (N_batch, N_f)
         t_fine = self.resample(t_coarse, sigma_co)
         color_fi, sigma_fi = self.net_out(t_fine, batch_hor, -batch_ver, trans_mat, self.num_fine)
 
         # Note: here t is for camara or world?
-        delta_co = torch.full((1, self.num_coarse), (far - near) / self.num_coarse).to(device)
-        # Below: (1, 192), (3, 192), (1, 192)
-        t = torch.cat((t_coarse, t_fine)).unsqueeze(dim = 0) # [192] -> [1, 192]
-        color = torch.cat((color_co, color_fi)).transpose(0, 1)
-        sigma = torch.cat((sigma_co, sigma_fi)).transpose(0, 1)
-        # (5, 192)
-        sort_bundle = torch.cat((t, color, sigma), dim = 0)
+        # (N_batch, N_c)
+        delta_co = torch.full((self.batch_ray, self.num_coarse), (far - near) / self.num_coarse).to(device)
+        # (N_batch, N_c) + (N_batch, N_f) -> (N_batch, N_c+N_f) -> (N_batch, N, 1)
+        t = torch.cat((t_coarse, t_fine), dim = 1).unsqueeze(2)
+        # (N_batch, N_point, N_channel), N_point = N_c + N_f
+        color = torch.cat((color_co, color_fi), dim = 1)
+        sigma = torch.cat((sigma_co, sigma_fi), dim = 1)
+        # (N_batch, N_c+N_f, 5)
+        sort_bundle = torch.cat((t, color, sigma), dim = 2)
+        #print(sort_bundle)
         bundle, _ = torch.sort(sort_bundle, dim = 1) # drop indices here
-        t = bundle[0]
-        color = bundle[1:4].transpose(0, 1)
-        sigma = bundle[4]
+        #print(bundle)
+
+        t = bundle[ : , : , 0] # (N_batch, N_points)
+        color = bundle[ : , : , 1:4] # (N_batch, N_points, 3)
+        sigma = bundle[ : , : , 4] # (N_batch, N_points)
+
         # Add a tiny interval at the tail
-        delta = torch.cat((t[1: ] - t[ :-1], torch.tensor([last]).to(device)))
+        delta = torch.cat((t[ : , 1: ] - t[ : , :-1], torch.full((self.batch_ray, 1), last).to(device)), dim = 1)
 
-        # Transform into row vectors
-        delta_co = delta_co[0]
-        sigma_co = sigma_co.transpose(0, 1)[0]
-
-        C_coarse = self.color_cum(delta_co, sigma_co, color_co)
+        # (N_batch, 3)
+        C_coarse = self.color_cum(delta_co, sigma_co[ : , : , 0], color_co)
         C_fine = self.color_cum(delta, sigma, color)
 
         return C_coarse, C_fine
