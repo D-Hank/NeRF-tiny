@@ -1,6 +1,6 @@
 import math
-from operator import index
 import time
+import glob
 import numpy as np
 import torch
 import torch.nn as nn
@@ -234,20 +234,22 @@ class NeRFModel(nn.Module):
         return C_coarse, C_fine
 
     def ray_loss(self, C_coarse, C_fine, C_true):
+        # (N_batch, 3)
+        # sum along both dimensions
         loss_1 = torch.sum(torch.square(C_coarse - C_true))
         loss_2 = torch.sum(torch.square(C_fine - C_true))
+
         return loss_1 + loss_2
 
-    def forward(self, hor, ver, trans_mat, near, far):
+    def forward(self, batch_hor, batch_ver, trans_mat, near, far):
         # In picture: [x, y] = [right, down]
         # Note: ignore batch here
         trans_mat = trans_mat.to(device)
-        batch_y = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1]).to(device)
-        batch_x = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3]).to(device)
-        return self.render_rays(batch_x, batch_y, trans_mat, near, far)
+        return self.render_rays(batch_hor, batch_ver, trans_mat, near, far)
 
 
 IMG_DIR = "../nerf_llff_data/fern/"
+MODEL_PATH = "./checkpoint/"
 LOW_RES = 8
 EPOCH = 10000
 BATCH_RAY = 8
@@ -263,93 +265,73 @@ def poses_extract(pb_matrix):
     return c_to_w, height, width, focal, near, far
 
 def NeRF_trainer():
-    model = NeRFModel(num_coarse = 4, num_fine = 4, batch_ray = BATCH_RAY).to(device)
+    model = NeRFModel(num_coarse = 16, num_fine = 32, batch_ray = BATCH_RAY).to(device)
     train_dataset = loader.NeRFDataset(root_dir = IMG_DIR, low_res = LOW_RES, transform = None)
     train_dataloader = DataLoader(dataset = train_dataset, batch_size = BATCH_PIC, shuffle = True, num_workers = 2)
 
     optimizer = torch.optim.Adam(model.parameters(), lr = 5e-4, betas = (0.9, 0.999), eps = 1e-7)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma = 0.1)
 
-    for epoch in range(EPOCH):
+    # Check existing checkpoint
+    ck_list = glob.glob(MODEL_PATH + "*.pkl")
+    last_epoch = -1
+    for file in ck_list:
+        ck = file.split("\\")[-1]
+        ep = int(ck[ : -4])
+        last_epoch = max(last_epoch, ep)
+
+    if ck_list:
+        print("Last epoch:", last_epoch)
+        model = torch.load(MODEL_PATH + str(last_epoch) + ".pkl")
+
+    for epoch in range(last_epoch + 1, EPOCH, 1):
         print("[EPOCH]", epoch)
         loop = tqdm(enumerate(train_dataloader), total = len(train_dataloader))
         for index, (img, poses_bounds) in loop:
             print("[IMG]", index, "[AT TIME]", time.asctime(time.localtime(time.time())))
             poses_bounds = poses_bounds.numpy()
             poses_bounds = poses_bounds[0]
-            #print(img.shape)
-            #exit(0)
             # [PIC, HEIGHT, WIDTH, CHANNEL]
             img = img[0].to(device)
+            #print(img)
             c_to_w, height, width, focal, near, far = poses_extract(poses_bounds)
             height = int(height) // LOW_RES
             width = int(width) // LOW_RES
             result = torch.rand(height, width, 3)
-            #print("NEAR:", near)
-            for ver in range(0, height):
-                print("VER: ", ver, "/", height)
-                for hor in range(0, width):
-                    # For each ray
-                    optimizer.zero_grad()
-                    # ver: 378, hor: 504
-                    # [BATCH, 3]
-                    C_true = img[ver, hor]
-                    C_coarse, C_fine = model(hor, ver, c_to_w, near, far)
-                    print(C_coarse.shape)
-                    loss = model.ray_loss(C_coarse, C_fine, C_true)
 
-                    loss.backward()
-                    optimizer.step()
-                    result[ver, hor] = C_fine
+            x, y = torch.meshgrid(torch.arange(0, width, 1), torch.arange(0, height, 1), indexing = 'xy')
+            num_batches = height * width // BATCH_RAY
+            trunc_pix = num_batches * BATCH_RAY
+            x = (x.to(device).flatten())[0:trunc_pix]
+            y = (y.to(device).flatten())[0:trunc_pix]
 
-                if(((ver % 10) == 0) or (ver == height - 1)):
+            for i in range(0, num_batches):
+                start_pix = i * BATCH_RAY
+                end_pix = (i + 1) * BATCH_RAY
+                batch_x = x[start_pix : end_pix]
+                batch_y = y[start_pix : end_pix]
+                # For ray batch
+                optimizer.zero_grad()
+                model.train()
+                # ver: 378, hor: 504
+                # [BATCH, 3]
+                C_true = img[batch_y, batch_x]
+                #print(C_true)
+                C_coarse, C_fine = model(batch_x, batch_y, c_to_w, near, far)
+                #print(C_coarse)
+                loss = model.ray_loss(C_coarse, C_fine, C_true)
+
+                loss.backward()
+                optimizer.step()
+                result[batch_y, batch_x] = C_fine.cpu()
+
+                if(((i % 1000) == 0) or (i == num_batches - 1)):
+                    print("[BATCH]", i, "/", num_batches)
                     plt.imsave("./results/" + str(epoch) + "/" + str(index) + ".jpg", result.detach().numpy())
 
         scheduler.step()
+        torch.save(model, MODEL_PATH + str(epoch))
 
-'''
-#t_c = torch.tensor([100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110])
-#s_c = torch.tensor([0.1, 0.15, 0.23, 0.3, 0.5, 0.8, 1.2, 0.9, 0.6, 0.38, 0.2])
-t_c = torch.tensor([100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110])
-s_c = torch.tensor([1.2, 0.9, 0.8, 0.5, 0.3, 0.6,  0.38, 0.1, 0.15, 0.23, 0.2])
-nerf = NeRFModel(num_fine = 10)
-nerf.resample(t_c, s_c)
-'''
-
-#c = torch.tensor([[2, 3, 4], [4, 5, 6]])
-#f = torch.tensor([2, 1, 2])
-#print(torch.mul(c, f))
-'''
-c = torch.tensor(1.8585)
-f = torch.tensor([0.0589, 0.1179, 0.1769, 0.2358, 0.2947, 0.3538, 0.4127, 0.4716, 0.5305,
-        0.5895, 0.6485, 0.7075, 0.7666, 0.8256, 0.8847, 0.9438, 1.0027, 1.0617,
-        1.1206, 1.1796, 1.2387, 1.2976, 1.3565, 1.4155, 1.4743, 1.5333, 1.5923,
-        1.6511, 1.7100, 1.7688, 1.8278, 1.8867])
-print(torch.nonzero(f < c))
-'''
-'''
-c = torch.tensor([-0.0892, -0.0844, -0.0796, -0.0747, -0.0699, -0.0650, -0.0602, -0.0554,
-        -0.0505, -0.0457, -0.0408, -0.0360, -0.0311, -0.0263, -0.0215, -0.0166])
-f = torch.tensor([-0.0118, -0.0236, -0.0353, -0.0471, -0.0588, -0.0706, -0.0823, -0.0941])
-for k in range(0, 16):
-    print(k)
-    print(torch.nonzero(c[k] > f)[-1])
-'''
-#c = torch.rand(3, 64)
-#f = torch.rand(1, 64)
-#print(c.shape)
-#print(f.shape)
-#print(torch.mul(c, f))
-'''
-def test():
-    x = np.arange(0, 6, 1)
-    y = np.arange(0, 3, 1)
-    xx, yy = np.meshgrid(x, y, indexing = 'xy')
-    xx = xx.flatten()
-    yy = yy.flatten()
-    print(xx)
-    print(yy)
-'''
 '''
 def test():
     m = torch.tensor([[[1, -1],
