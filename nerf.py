@@ -1,4 +1,5 @@
 import math
+from operator import index
 import time
 import numpy as np
 import torch
@@ -97,9 +98,6 @@ class Encoder(nn.Module):
         # (N_batch, N_points, N_channel, L+L)
         gamma_point = gamma_bundle[ : , : , : , : 2 * self.L_point]
         gamma_dir = gamma_bundle[ : , : , : , 2 * self.L_point : ]
-        #print(gamma_point)
-        #print(gamma_dir)
-        #exit(0)
         gamma = (gamma_point, gamma_dir)
 
         return gamma
@@ -149,18 +147,20 @@ class NeRFModel(nn.Module):
 
     # Get cdf of coarse sampling, then with its reverse, we use uniform sampling along the horizontal axis
     def resample(self, t_coarse, sigma_coarse):
-        # t_coarse: (N_batch, N_points)
-        # sigma_coarse: (N_batch, N_points, 1)
+        # t_coarse: (N_batch, N_c)
+        # sigma_coarse: (N_batch, N_c, 1) -> (N_batch, N_c)\
+        sigma_coarse = sigma_coarse.squeeze()
 
-        # (N_batch, N_points)
-        cdf = torch.cumsum(sigma_coarse, dim = 1).squeeze()
+        # (N_batch, N_c)
+        cdf = torch.cumsum(sigma_coarse, dim = 1).contiguous()
         # drop indices
         # shape: (N_batch)
         high, _ = torch.max(cdf, dim = 1)
         low, _ = torch.min(cdf, dim = 1)
         delta = t_coarse[0, 1] - t_coarse[0, 0]
         # Slope of cdf is not zero, so its inverse is not infinite
-        slope = sigma_coarse[1: ] / delta
+        # cdf - cdf = sigma
+        slope = sigma_coarse[ : , 1: ] / delta
         slope_inv = 1.0 / slope
         high = high.detach().cpu().numpy()
         low = low.detach().cpu().numpy()
@@ -168,15 +168,21 @@ class NeRFModel(nn.Module):
         t_inv = np.linspace(tuple(low), tuple(high), self.num_fine + 2)
         # Init value, drop start and end
         # (N_batch, N_fine)
-        t_inv = torch.tensor(t_inv[1:-1]).transpose(0, 1)
+        t_inv = torch.tensor(t_inv[1:-1]).to(device).transpose(0, 1).contiguous()
+        # indices of t_inv when inserted in cdf
+        index_fine = torch.searchsorted(cdf, t_inv) - 1
 
-        t_fine = (torch.rand(1, self.num_fine))[0].to(device)
-        for i in range(0, self.num_fine):
-            # select those less than, and keep the last one (max less than)
-            sel_le = torch.nonzero(t_inv[i] > cdf)
-            sel_le = sel_le[-1]
-            # Linear increment
-            t_fine[i] = t_coarse[sel_le] + (t_inv[i] - cdf[sel_le]) * slope_inv[sel_le]
+        print(t_coarse.shape)
+        print(index_fine.shape)
+        print(slope_inv.shape)
+        lower_t = torch.gather(t_coarse, dim = 1, index = index_fine)
+        lower_cdf = torch.gather(cdf, dim = 1, index = index_fine)
+        # Add an extra column to fit the function, but we will not use it then
+        lower_slope = torch.gather(torch.cat((slope_inv, torch.zeros(self.batch_ray, 1).to(device)), dim = 1), dim = 1, index = index_fine)
+        t_fine = lower_t + (t_inv - lower_cdf) * lower_slope
+        print(t_coarse)
+        print(t_fine)
+        exit(0)
 
         return t_fine
 
@@ -366,9 +372,20 @@ def test():
 '''
 
 def test():
-    m = torch.tensor([1, 2, 3]).reshape(1, 3)
-    n = torch.tensor([10, 9, 8]).reshape(1, 3)
-    print(np.linspace(tuple(m.numpy()), tuple(n.numpy()), 5))
+    m = torch.tensor([[ 1,  6,  9],
+                      [ 3,  4, 13]])
+    n = torch.tensor([[ 2,  7,  8],
+                      [10, 11, 12]])
+    i = torch.argsort(torch.cat((m, n), dim = 1), dim = 1)
+    #print(i)
+    a = torch.tensor([9.3, 4.2, 8.5, 2.7, 5.9, 8.7])
+    b = torch.nonzero(a > 5)
+    #print(b)
+    #print(a[b])
+    c = torch.index_select(a, dim = 0, index = b.squeeze())
+    print(m)
+    print(n)
+    print(torch.searchsorted(m, n))
 
 if __name__ == "__main__":
     NeRF_trainer()
