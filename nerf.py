@@ -116,11 +116,13 @@ class NeRFModel(nn.Module):
         self.num_fine = num_fine
         self.batch_ray = batch_ray
 
+    # Local coordinates: [x, y, z] = [right, up, back]
     def net_out(self, t_array, batch_x, batch_y, trans_mat, K, num_points):
         # Notice: homogeneous coordinates here!
         # t_array: shape as (N_batch, N_points)
         # batch_x: shape as (N_batch)
         # xy_hom: shape as (3, N_batch)
+        # Notice: get image inverted!
         xy_hom = torch.cat((
             batch_x.unsqueeze(0),
             batch_y.unsqueeze(0),
@@ -130,7 +132,7 @@ class NeRFModel(nn.Module):
         # (3, N_batch, N_points)
         points_scale = torch.mul(xy_hom.unsqueeze(2).repeat(1, 1, num_points), t_array.repeat(3, 1, 1))
         # Broadcast multiplication: (N_batch, N_points, 3) * (3, 3) -> (N_batch, N_points, 3)
-        points_cam = torch.matmul(points_scale.permute(1, 2, 0), torch.inverse(K))
+        points_cam = torch.matmul(points_scale.permute(1, 2, 0), torch.inverse(K).transpose(0, 1))
         # (N_batch, N_points, 4)
         points_cam = torch.cat((points_cam, torch.ones((self.batch_ray, num_points, 1)).to(device)), dim = 2)
         # (4, 1), column vector
@@ -208,11 +210,11 @@ class NeRFModel(nn.Module):
     def render_rays(self, batch_hor, batch_ver, trans_mat, K, near, far, last = 0.0001):
         # Shape as (N_batch, N_points)
         t_coarse = torch.linspace(near, far, self.num_coarse).to(device).unsqueeze(0).repeat(self.batch_ray, 1)
-        color_co, sigma_co = self.net_out(t_coarse, batch_hor, -batch_ver, trans_mat, K, self.num_coarse)
+        color_co, sigma_co = self.net_out(t_coarse, batch_hor, batch_ver, trans_mat, K, self.num_coarse)
 
         # Shape as (N_batch, N_f)
         t_fine = self.resample(t_coarse, sigma_co)
-        color_fi, sigma_fi = self.net_out(t_fine, batch_hor, -batch_ver, trans_mat, K, self.num_fine)
+        color_fi, sigma_fi = self.net_out(t_fine, batch_hor, batch_ver, trans_mat, K, self.num_fine)
 
         # Note: here t is for camara or world?
         # (N_batch, N_c)
@@ -261,7 +263,7 @@ IMG_DIR = "../nerf_llff_data/fern/"
 MODEL_PATH = "./checkpoint/"
 LOW_RES = 8
 EPOCH = 10000
-BATCH_RAY = 378
+BATCH_RAY = 441
 BATCH_PIC = 1
 NUM_PIC = 20
 
@@ -278,9 +280,9 @@ def poses_extract(pb_matrix):
 def NeRF_trainer():
     model = NeRFModel(num_coarse = 64, num_fine = 128, batch_ray = BATCH_RAY).to(device)
     train_dataset = loader.NeRFDataset(root_dir = IMG_DIR, low_res = LOW_RES, transform = None)
-    train_dataloader = DataLoader(dataset = train_dataset, batch_size = BATCH_PIC, shuffle = False, num_workers = 1)
+    train_dataloader = DataLoader(dataset = train_dataset, batch_size = BATCH_PIC, shuffle = True, num_workers = 2)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr = 1e-4, betas = (0.9, 0.999), eps = 1e-7)
+    optimizer = torch.optim.Adam(model.parameters(), lr = 3e-5, betas = (0.9, 0.999), eps = 1e-7)
     #scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma = 0.1)
 
     # Check existing checkpoint
@@ -307,14 +309,14 @@ def NeRF_trainer():
             c_to_w, height, width, focal, near, far = poses_extract(poses_bounds)
             height = int(height) // LOW_RES
             width = int(width) // LOW_RES
-            K = torch.tensor([[focal, 0.0, width * 0.5], [0.0, focal, height * 0.5], [0.0, 0.0, 1.0]]).to(torch.float)
+            K = torch.tensor([[focal, 0.0, width * 0.5], [0.0, -focal, height * 0.5], [0.0, 0.0, 1.0]]).to(torch.float)
             result = torch.rand(height, width, 3)
 
             x, y = torch.meshgrid(torch.arange(0, width, 1), torch.arange(0, height, 1), indexing = 'xy')
             num_batches = height * width // BATCH_RAY
             trunc_pix = num_batches * BATCH_RAY
-            x = (x.to(device).flatten())[0:trunc_pix]
-            y = (y.to(device).flatten())[0:trunc_pix]
+            x = (x.to(device).flatten())[0 : trunc_pix]
+            y = (y.to(device).flatten())[0 : trunc_pix]
 
             avg_loss = 0.0
 
