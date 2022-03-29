@@ -1,30 +1,35 @@
 import math
 import time
 import glob
+import random
+import os
 import numpy as np
 import torch
 import torch.nn as nn
-import pytorch_lightning as pl
 import matplotlib.pyplot as plt
 
 import loader
 
 from torch.utils.data import DataLoader
-from tqdm.notebook import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
 plt.set_cmap("cividis")
 
-DATASET_PATH = "C:\\Users\\Admin\\Desktop\\NeRF\\nerf_llff_data\\fern"
-CHECKPOINT_PATH = "C:\\Users\\Admin\\Desktop\\NeRF\\nerf_reproduce\\checkpoint"
-
-pl.seed_everything(624)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
+writer = SummaryWriter()
 device = torch.device("cpu") if not torch.cuda.is_available() else torch.device("cuda:0")
 print("Using device", device)
 
-first = 0
+def seed_everything(seed):
+    os.environ["PL_GLOBAL_SEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+seed_everything(624)
 
 class Network(nn.Module):
     def __init__(self, point_dim = 60, dir_dim = 24, depth = 8, width = 256, batch_size = 8):
@@ -111,25 +116,28 @@ class NeRFModel(nn.Module):
         self.num_fine = num_fine
         self.batch_ray = batch_ray
 
-    def net_out(self, t_array, batch_x, batch_y, trans_mat, num_points):
+    def net_out(self, t_array, batch_x, batch_y, trans_mat, K, num_points):
         # Notice: homogeneous coordinates here!
         # t_array: shape as (N_batch, N_points)
         # batch_x: shape as (N_batch)
-        # xy_hom: shape as (4, N_batch)
+        # xy_hom: shape as (3, N_batch)
         xy_hom = torch.cat((
             batch_x.unsqueeze(0),
             batch_y.unsqueeze(0),
-            torch.zeros(1, self.batch_ray).to(device),
             torch.ones(1, self.batch_ray).to(device)), dim = 0)
-        # Revise Column z coordinate
-        # (4, N_batch, N_points)
-        points_cam = xy_hom.unsqueeze(2).repeat(1, 1, num_points)
-        points_cam[2, : , : ] = t_array
+        # Use t as z_c
+        # Pixel coordinates -> Camara coordinates
+        # (3, N_batch, N_points)
+        points_scale = torch.mul(xy_hom.unsqueeze(2).repeat(1, 1, num_points), t_array.repeat(3, 1, 1))
+        # Broadcast multiplication: (N_batch, N_points, 3) * (3, 3) -> (N_batch, N_points, 3)
+        points_cam = torch.matmul(points_scale.permute(1, 2, 0), torch.inverse(K))
+        # (N_batch, N_points, 4)
+        points_cam = torch.cat((points_cam, torch.ones((self.batch_ray, num_points, 1)).to(device)), dim = 2)
         # (4, 1), column vector
         dir_cam = torch.tensor([0.0, 0.0, -1.0, 1.0]).reshape(4, -1).to(device)
         # [[x, y, z, 1], [x, y, z, 1], ...], points in batch
         # Broadcast multiplication: (N_batch, N_points, 4) * (4, 4) -> (N_batch, N_points, 4)
-        points_wrd = torch.matmul(points_cam.permute(1, 2, 0), trans_mat.transpose(0, 1))
+        points_wrd = torch.matmul(points_cam, trans_mat.transpose(0, 1))
         # (4, 1)
         dir_wrd = torch.mm(trans_mat, dir_cam)
 
@@ -197,14 +205,14 @@ class NeRFModel(nn.Module):
     # Render a ray batch (drop last batch)
     # Local coordinate: [x, y, z] = [right, up, back]
     # Notice: some redundant calculation here!
-    def render_rays(self, batch_hor, batch_ver, trans_mat, near, far, last = 0.0001):
+    def render_rays(self, batch_hor, batch_ver, trans_mat, K, near, far, last = 0.0001):
         # Shape as (N_batch, N_points)
         t_coarse = torch.linspace(near, far, self.num_coarse).to(device).unsqueeze(0).repeat(self.batch_ray, 1)
-        color_co, sigma_co = self.net_out(t_coarse, batch_hor, -batch_ver, trans_mat, self.num_coarse)
+        color_co, sigma_co = self.net_out(t_coarse, batch_hor, -batch_ver, trans_mat, K, self.num_coarse)
 
         # Shape as (N_batch, N_f)
         t_fine = self.resample(t_coarse, sigma_co)
-        color_fi, sigma_fi = self.net_out(t_fine, batch_hor, -batch_ver, trans_mat, self.num_fine)
+        color_fi, sigma_fi = self.net_out(t_fine, batch_hor, -batch_ver, trans_mat, K, self.num_fine)
 
         # Note: here t is for camara or world?
         # (N_batch, N_c)
@@ -241,23 +249,26 @@ class NeRFModel(nn.Module):
 
         return loss_1 + loss_2
 
-    def forward(self, batch_hor, batch_ver, trans_mat, near, far):
+    def forward(self, batch_hor, batch_ver, trans_mat, K, near, far):
         # In picture: [x, y] = [right, down]
-        # Note: ignore batch here
+        # K: intrinsic matrix
         trans_mat = trans_mat.to(device)
-        return self.render_rays(batch_hor, batch_ver, trans_mat, near, far)
+        K = K.to(device)
+        return self.render_rays(batch_hor, batch_ver, trans_mat, K, near, far)
 
 
 IMG_DIR = "../nerf_llff_data/fern/"
 MODEL_PATH = "./checkpoint/"
 LOW_RES = 8
 EPOCH = 10000
-BATCH_RAY = 8
+BATCH_RAY = 378
 BATCH_PIC = 1
+NUM_PIC = 20
 
 def poses_extract(pb_matrix):
     pose = pb_matrix[ :-2].reshape(3, 5)
     c_to_w = torch.tensor(pose[ : , :-1]).to(torch.float)
+    # Notice: for focal: suppose unit length is 1 pixel
     hwf = pose[ : , -1]
     height, width, focal = hwf
     near, far = pb_matrix[-2: ]
@@ -265,12 +276,12 @@ def poses_extract(pb_matrix):
     return c_to_w, height, width, focal, near, far
 
 def NeRF_trainer():
-    model = NeRFModel(num_coarse = 16, num_fine = 32, batch_ray = BATCH_RAY).to(device)
+    model = NeRFModel(num_coarse = 64, num_fine = 128, batch_ray = BATCH_RAY).to(device)
     train_dataset = loader.NeRFDataset(root_dir = IMG_DIR, low_res = LOW_RES, transform = None)
-    train_dataloader = DataLoader(dataset = train_dataset, batch_size = BATCH_PIC, shuffle = True, num_workers = 2)
+    train_dataloader = DataLoader(dataset = train_dataset, batch_size = BATCH_PIC, shuffle = False, num_workers = 1)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr = 5e-4, betas = (0.9, 0.999), eps = 1e-7)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma = 0.1)
+    optimizer = torch.optim.Adam(model.parameters(), lr = 1e-4, betas = (0.9, 0.999), eps = 1e-7)
+    #scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma = 0.1)
 
     # Check existing checkpoint
     ck_list = glob.glob(MODEL_PATH + "*.pkl")
@@ -286,8 +297,7 @@ def NeRF_trainer():
 
     for epoch in range(last_epoch + 1, EPOCH, 1):
         print("[EPOCH]", epoch)
-        loop = tqdm(enumerate(train_dataloader), total = len(train_dataloader))
-        for index, (img, poses_bounds) in loop:
+        for index, (img, poses_bounds) in enumerate(train_dataloader):
             print("[IMG]", index, "[AT TIME]", time.asctime(time.localtime(time.time())))
             poses_bounds = poses_bounds.numpy()
             poses_bounds = poses_bounds[0]
@@ -297,6 +307,7 @@ def NeRF_trainer():
             c_to_w, height, width, focal, near, far = poses_extract(poses_bounds)
             height = int(height) // LOW_RES
             width = int(width) // LOW_RES
+            K = torch.tensor([[focal, 0.0, width * 0.5], [0.0, focal, height * 0.5], [0.0, 0.0, 1.0]]).to(torch.float)
             result = torch.rand(height, width, 3)
 
             x, y = torch.meshgrid(torch.arange(0, width, 1), torch.arange(0, height, 1), indexing = 'xy')
@@ -304,6 +315,8 @@ def NeRF_trainer():
             trunc_pix = num_batches * BATCH_RAY
             x = (x.to(device).flatten())[0:trunc_pix]
             y = (y.to(device).flatten())[0:trunc_pix]
+
+            avg_loss = 0.0
 
             for i in range(0, num_batches):
                 start_pix = i * BATCH_RAY
@@ -317,42 +330,34 @@ def NeRF_trainer():
                 # [BATCH, 3]
                 C_true = img[batch_y, batch_x]
                 #print(C_true)
-                C_coarse, C_fine = model(batch_x, batch_y, c_to_w, near, far)
+                C_coarse, C_fine = model(batch_x, batch_y, c_to_w, K, near, far)
                 #print(C_coarse)
                 loss = model.ray_loss(C_coarse, C_fine, C_true)
+                avg_loss += float(loss)
 
                 loss.backward()
                 optimizer.step()
                 result[batch_y, batch_x] = C_fine.cpu()
 
-                if(((i % 1000) == 0) or (i == num_batches - 1)):
-                    print("[BATCH]", i, "/", num_batches)
-                    plt.imsave("./results/" + str(epoch) + "/" + str(index) + ".jpg", result.detach().numpy())
+                if(((i % 50) == 0) or (i == num_batches - 1)):
+                    print("[BATCH]", i, "/", num_batches, " [LOSS] %.4f "%float(loss),
+                          "[T] (%.4f"%float(C_true[0][0]),"%.4f"%float(C_true[0][1]),"%.4f)"%float(C_true[0][2]),
+                          "[F] (%.4f"%float(C_fine[0][0]),"%.4f"%float(C_fine[0][1]),"%.4f)"%float(C_fine[0][2]))
+                    plt.imsave("./results/" + str(index) + "/" + str(epoch) + ".jpg", result.detach().numpy())
 
-        scheduler.step()
-        torch.save(model, MODEL_PATH + str(epoch))
+                # Use tensorboard to record
+
+                writer.add_scalar("loss/train", loss, epoch * NUM_PIC * num_batches + index * num_batches + i)
+                writer.add_scalar("lr/train", optimizer.state_dict()['param_groups'][0]['lr'], epoch * NUM_PIC * num_batches + index * num_batches + i)
+                writer.flush()
+
+            avg_loss = avg_loss / num_batches
+            print("[AVG]", avg_loss)
+
+        #scheduler.step()
+        torch.save(model, MODEL_PATH + str(epoch) + ".pkl")
 
 '''
-def test():
-    m = torch.tensor([[[1, -1],
-                    [1, -1],
-                    [1, -1]],
-                  [[2, -2],
-                    [2, -2],
-                    [2, -2]],
-                  [[3, -3],
-                    [3, -3],
-                    [3, -3]],
-                  [[4, -4],
-                    [4, -4],
-                    [4, -4]],
-                  [[5, -5],
-                    [5, -5],
-                    [5, -5]]])
-    # (5, 3, 2) -> (3, 5+5)
-    print(m.permute(1, 0, 2).flatten(start_dim = 1, end_dim = 2))
-'''
-
 def test():
     m = torch.tensor([[ 1,  6,  9],
                       [ 3,  4, 13]])
@@ -368,6 +373,12 @@ def test():
     print(m)
     print(n)
     print(torch.searchsorted(m, n))
+'''
+
+def test():
+    m = torch.full((3, 10, 1), 2)
+    n = torch.full((1, 10, 4), 3)
+    print(torch.mul(m, n))
 
 if __name__ == "__main__":
     NeRF_trainer()
