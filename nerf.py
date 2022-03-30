@@ -1,4 +1,5 @@
 import math
+from re import X
 import time
 import glob
 import random
@@ -314,11 +315,13 @@ def NeRF_trainer():
             K_inv = torch.tensor([[1.0 / focal, 0.0, -0.5 * width / focal], [0.0, -1.0 / focal, 0.5 * height / focal], [0.0, 0.0, -1.0]]).to(torch.float)
             result = torch.rand(height, width, 3)
 
+            # randomize x and y
+            # Note: here spatial correlation is dropped
             x, y = torch.meshgrid(torch.arange(0, width, 1), torch.arange(0, height, 1), indexing = 'xy')
             num_batches = height * width // BATCH_RAY
             trunc_pix = num_batches * BATCH_RAY
-            x = (x.to(device).flatten())[0 : trunc_pix]
-            y = (y.to(device).flatten())[0 : trunc_pix]
+            xy = torch.cat(((x.to(device).flatten()[0 : trunc_pix]).unsqueeze(0), (y.to(device).flatten()[0 : trunc_pix]).unsqueeze(0)), dim = 0)
+            x, y = xy[ : , torch.randperm(trunc_pix)]
 
             avg_loss = 0.0
 
@@ -361,20 +364,21 @@ def NeRF_trainer():
         #scheduler.step()
         torch.save(model, MODEL_PATH + str(epoch) + ".pkl")
 
-
+'''
 def test():
     m = torch.tensor([[ 2.0,  3.0,  4.0],
                       [ 4.0,  5.0,  6.0]])
     n = torch.tensor([[ 2,  7,  8],
                       [10, 11, 12]])
     print(functional.normalize(m, p = 2.0, dim = 1))
+'''
 
-'''
 def test():
-    m = torch.full((3, 10, 1), 2)
-    n = torch.full((1, 10, 4), 3)
-    print(torch.mul(m, n))
-'''
+    x, y = torch.meshgrid(torch.arange(0, 4, 1), torch.arange(0, 3, 1), indexing = 'xy')
+    xy = torch.cat((x.flatten().unsqueeze(0), y.flatten().unsqueeze(0)), dim = 0)[ : , torch.randperm(12)]
+    x, y = xy
+    print(x)
+    print(y)
 
 
 if __name__ == "__main__":
