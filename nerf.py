@@ -312,7 +312,7 @@ def NeRF_trainer():
             width = int(width) // LOW_RES
             # inverse of intrinsic matrix
             K_inv = torch.tensor([[1.0 / focal, 0.0, -0.5 * width / focal], [0.0, -1.0 / focal, 0.5 * height / focal], [0.0, 0.0, -1.0]]).to(torch.float)
-            result = torch.rand(height, width, 3)
+            result = torch.full((height, width, 3), 1.0)
 
             # randomize x and y
             # Note: here spatial correlation is dropped

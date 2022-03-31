@@ -1,7 +1,7 @@
+from turtle import back
 import numpy as np
 import os
 import json
-import torch
 import numpy as np
 
 from PIL import Image
@@ -45,6 +45,7 @@ class NeRFDataset(Dataset):
         self.transform = transform
         self.file_list = []
         self.pic_num = 0
+        self.type = type
 
         if type == "llff":
             if low_res == None:
@@ -52,14 +53,11 @@ class NeRFDataset(Dataset):
             else:
                 img_dir = root_dir + "images_" + str(low_res) + "/"
 
-            self.div_255 = 1.0
-
         if type =="sync":
             if os.path.isfile(root_dir + "poses_bounds.npy") == False:
                 create_npy(root_dir)
 
             img_dir = root_dir + "train/"
-            self.div_255 = 255.0
 
         self.poses_bounds = np.load(root_dir + "poses_bounds.npy")
 
@@ -67,14 +65,35 @@ class NeRFDataset(Dataset):
             self.file_list.append(os.path.join(img_dir, file))
             self.pic_num += 1
 
+    # REFERENCE: https://stackoverflow.com/questions/9166400/convert-rgba-png-to-rgb-with-pil
+    def get_img(self, img_path):
+        image = Image.open(img_path)
+        image.load()
+
+        if self.type == "llff":
+            return np.array(image)
+
+        else:
+            background = Image.new('RGB', image.size, (255, 255, 255))
+            background.paste(image, mask = image.split()[3]) # 3 is the alpha channel
+
+            return np.array(background) / 255.0
+
     def __len__(self):
         return self.pic_num
 
     def __getitem__(self, idx):
         img_path = self.file_list[idx]
-        img = np.array(Image.open(img_path).convert("RGB")) / self.div_255
+        img = self.get_img(img_path)
         poses_bound = self.poses_bounds[idx]
 
         #print(poses_bounds[idx])
         return img, poses_bound
 
+'''
+png = Image.open("../nerf_synthetic/lego/train/r_0.png")
+png.load()
+background = Image.new('RGB', png.size, (255, 255, 255))
+background.paste(png, mask=png.split()[3]) # 3 is the alpha channel
+background.save('test.jpg', 'JPEG', quality=80)
+'''
