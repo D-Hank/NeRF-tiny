@@ -1,5 +1,4 @@
 import math
-from re import X
 import time
 import glob
 import random
@@ -284,7 +283,7 @@ def NeRF_trainer():
     train_dataset = loader.NeRFDataset(root_dir = IMG_DIR, low_res = LOW_RES, transform = None)
     train_dataloader = DataLoader(dataset = train_dataset, batch_size = BATCH_PIC, shuffle = True, num_workers = 2)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr = 3e-5, betas = (0.9, 0.999), eps = 1e-7)
+    optimizer = torch.optim.Adam(model.parameters(), lr = 5e-5, betas = (0.9, 0.999), eps = 1e-7)
     #scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma = 0.1)
 
     # Check existing checkpoint
