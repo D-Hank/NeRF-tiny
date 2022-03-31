@@ -1,28 +1,67 @@
-import imghdr
-from logging import root
 import numpy as np
-import matplotlib.pyplot as plt
 import os
+import json
+import torch
+import numpy as np
 
 from PIL import Image
-from matplotlib.image import imread
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 
+NEAR_FACTOR = 2.0
+FAR_FACTOR = 6.0
+
+def create_npy(root_dir):
+    with open(root_dir + "transforms_train.json") as json_file:
+        jf = json.load(json_file)
+
+    angle = jf['camera_angle_x']
+    frame = jf['frames']
+    pic_num = len(frame)
+
+    # read one img to see
+    img_0 = Image.open(root_dir + frame[0]['file_path'][2: ] + ".png")
+    width, height = img_0.size
+    focal = 0.5 * width * np.tan(0.5 * angle)
+    near = NEAR_FACTOR
+    far = FAR_FACTOR
+
+    img_0 = img_0.convert("RGB").load()
+    poses_bounds = np.zeros((pic_num, 17))
+
+    for i in range(pic_num):
+        matrix = np.array(frame[i]['transform_matrix'])
+        # Column vector
+        poses_bound = np.concatenate((np.concatenate((matrix[ :3, :4], np.array([[height], [width], [focal]])), axis = 1).flatten(), np.array([near, far])), axis = 0)
+        poses_bounds[i] = poses_bound
+
+    np.save(root_dir + "poses_bounds.npy", poses_bounds)
+
 
 class NeRFDataset(Dataset):
-    def __init__(self, root_dir, low_res = 8, transform = None):
+    def __init__(self, root_dir, low_res = 8, transform = None, type = "sync"):
         self.root_dir = root_dir
         self.low_res = low_res
         self.transform = transform
         self.file_list = []
         self.pic_num = 0
-        self.poses_bounds = np.load(root_dir + "poses_bounds.npy")
 
-        if low_res == None:
-            img_dir = root_dir + "images/"
-        else:
-            img_dir = root_dir + "images_" + str(low_res) + "/"
+        if type == "llff":
+            if low_res == None:
+                img_dir = root_dir + "images/"
+            else:
+                img_dir = root_dir + "images_" + str(low_res) + "/"
+
+            self.div_255 = 1.0
+
+        if type =="sync":
+            if os.path.isfile(root_dir + "poses_bounds.npy") == False:
+                create_npy(root_dir)
+
+            img_dir = root_dir + "train/"
+            self.div_255 = 255.0
+
+        self.poses_bounds = np.load(root_dir + "poses_bounds.npy")
 
         for file in os.listdir(img_dir):
             self.file_list.append(os.path.join(img_dir, file))
@@ -33,28 +72,9 @@ class NeRFDataset(Dataset):
 
     def __getitem__(self, idx):
         img_path = self.file_list[idx]
-        img = imread(img_path)
+        img = np.array(Image.open(img_path).convert("RGB")) / self.div_255
         poses_bound = self.poses_bounds[idx]
 
         #print(poses_bounds[idx])
         return img, poses_bound
-
-'''
-train_dataset = NeRFDataset(root_dir = img_dir + "images_8/", transform = None)
-train_dataloader = DataLoader(dataset = train_dataset, batch_size = 4, shuffle = True, num_workers = 4)
-#print(poses_bounds[0])
-
-plt.figure()
-for (cnt, i) in enumerate(train_dataset):
-    image, label = i
-    #ax = plt.subplot(5, 4, cnt+1)
-    #ax.axis('off')
-    #ax.imshow(image)
-    #ax.set_title('label {}'.format(label))
-    #plt.pause(1)
-    #with open("img.txt","w") as f:
-    #    f.write("\n".join(" ".join(map(str, x)) for x in image))
-    print(image)
-    exit(0)
-'''
 
