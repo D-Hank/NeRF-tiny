@@ -1,4 +1,5 @@
 from turtle import back
+from matplotlib.pyplot import axis
 import numpy as np
 import os
 import json
@@ -35,7 +36,24 @@ def create_npy(root_dir):
         poses_bound = np.concatenate((np.concatenate((matrix[ :3, :4], np.array([[height], [width], [focal]])), axis = 1).flatten(), np.array([near, far])), axis = 0)
         poses_bounds[i] = poses_bound
 
-    np.save(root_dir + "poses_bounds.npy", poses_bounds)
+    np.save(root_dir + "new.npy", poses_bounds)
+
+def convert_npy(root_dir):
+    src_trans = np.load(root_dir + "poses_bounds.npy")
+    dest_trans = np.zeros_like(src_trans)
+    len, _ = src_trans.shape
+    print(src_trans[0])
+    for i in range(len):
+        mat = src_trans[i]
+        pose = mat[ :-2].reshape(3, 5)
+        near_far = mat[-2: ]
+        c_to_w = pose[ : , :4]
+        hwf = pose[ : , 4]
+        new_ctw = np.concatenate((c_to_w[ : , 1], -c_to_w[ : , 0], c_to_w[ : , 2]), axis = 0)
+        new_pose = np.concatenate((new_ctw.reshape(3, 3).transpose(), c_to_w[ : , 3].reshape(3, 1), hwf.reshape(3, 1)), axis = 1).flatten()
+        dest_trans[i] = np.concatenate((new_pose, near_far), axis = 0)
+
+    np.save(root_dir + "new.npy", dest_trans)
 
 
 class NeRFDataset(Dataset):
@@ -48,18 +66,21 @@ class NeRFDataset(Dataset):
         self.type = type
 
         if type == "llff":
-            if low_res == None:
-                img_dir = root_dir + "images/"
+            if os.path.isfile(root_dir + "new.npy") == False:
+                convert_npy(root_dir)
+
+            if low_res == 8:
+                img_dir = root_dir + "images_8/"
             else:
-                img_dir = root_dir + "images_" + str(low_res) + "/"
+                img_dir = root_dir + "images/"
 
         if type =="sync":
-            if os.path.isfile(root_dir + "poses_bounds.npy") == False:
+            if os.path.isfile(root_dir + "new.npy") == False:
                 create_npy(root_dir)
 
             img_dir = root_dir + "train/"
 
-        self.poses_bounds = np.load(root_dir + "poses_bounds.npy")
+        self.poses_bounds = np.load(root_dir + "new.npy")
 
         for file in os.listdir(img_dir):
             self.file_list.append(os.path.join(img_dir, file))
@@ -71,7 +92,7 @@ class NeRFDataset(Dataset):
         image.load()
 
         if self.type == "llff":
-            return np.array(image)
+            return np.array(image) / 255.0
 
         else:
             background = Image.new('RGB', image.size, (255, 255, 255))

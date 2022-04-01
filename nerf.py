@@ -260,13 +260,14 @@ class NeRFModel(nn.Module):
         return self.render_rays(batch_hor, batch_ver, trans_mat, K_inv, near, far)
 
 
-IMG_DIR = "../nerf_synthetic/lego/"
+IMG_DIR = "../nerf_llff_data/fern/"
 MODEL_PATH = "./checkpoint/"
 LOW_RES = 1
 EPOCH = 10000
-BATCH_RAY = 400
+BATCH_RAY = 192
 BATCH_PIC = 1
 NUM_PIC = 20
+DATA_TYPE = "llff"
 
 def poses_extract(pb_matrix):
     pose = pb_matrix[ :-2].reshape(3, 5)
@@ -280,10 +281,10 @@ def poses_extract(pb_matrix):
 
 def NeRF_trainer():
     model = NeRFModel(num_coarse = 64, num_fine = 128, batch_ray = BATCH_RAY).to(device)
-    train_dataset = loader.NeRFDataset(root_dir = IMG_DIR, low_res = LOW_RES, transform = None, type = "sync")
+    train_dataset = loader.NeRFDataset(root_dir = IMG_DIR, low_res = LOW_RES, transform = None, type = DATA_TYPE)
     train_dataloader = DataLoader(dataset = train_dataset, batch_size = BATCH_PIC, shuffle = True, num_workers = 2)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr = 5e-5, betas = (0.9, 0.999), eps = 1e-7)
+    optimizer = torch.optim.Adam(model.parameters(), lr = 5e-6, betas = (0.9, 0.999), eps = 1e-7)
     #scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma = 0.1)
 
     # Check existing checkpoint
