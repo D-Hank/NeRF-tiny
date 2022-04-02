@@ -14,6 +14,18 @@ import loader
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
+
+IMG_DIR = "../nerf_llff_data/fern/"
+MODEL_PATH = "./checkpoint/"
+LOW_RES = 1
+EPOCH = 10000
+BATCH_RAY = 1024 * 10
+BATCH_PIC = 1
+LEARNING = 5e-4
+NUM_PIC = 20
+DATA_TYPE = "llff"
+
+
 plt.set_cmap("cividis")
 
 torch.backends.cudnn.deterministic = True
@@ -260,15 +272,6 @@ class NeRFModel(nn.Module):
         return self.render_rays(batch_hor, batch_ver, trans_mat, K_inv, near, far)
 
 
-IMG_DIR = "../nerf_llff_data/fern/"
-MODEL_PATH = "./checkpoint/"
-LOW_RES = 1
-EPOCH = 10000
-BATCH_RAY = 192
-BATCH_PIC = 1
-NUM_PIC = 20
-DATA_TYPE = "llff"
-
 def poses_extract(pb_matrix):
     pose = pb_matrix[ :-2].reshape(3, 5)
     c_to_w = torch.tensor(pose[ : , :-1]).to(torch.float)
@@ -284,7 +287,7 @@ def NeRF_trainer():
     train_dataset = loader.NeRFDataset(root_dir = IMG_DIR, low_res = LOW_RES, transform = None, type = DATA_TYPE)
     train_dataloader = DataLoader(dataset = train_dataset, batch_size = BATCH_PIC, shuffle = True, num_workers = 2)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr = 5e-6, betas = (0.9, 0.999), eps = 1e-7)
+    optimizer = torch.optim.Adam(model.parameters(), lr = LEARNING, betas = (0.9, 0.999), eps = 1e-7)
     #scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma = 0.1)
 
     # Check existing checkpoint
