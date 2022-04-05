@@ -3,6 +3,7 @@ import time
 import glob
 import random
 import os
+from turtle import forward
 import numpy as np
 import torch
 import torch.nn as nn
@@ -14,22 +15,27 @@ import loader
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
+MODEL = 0
 
-IMG_DIR = "../nerf_llff_data/fern/"
+IMG_DIR = "../nerf_synthetic/lego/" if MODEL > 0 else "../nerf_llff_data/fern/"
 MODEL_PATH = "./checkpoint/"
 LOW_RES = 1
 EPOCH = 10000
-BATCH_RAY = 1024 * 10
+BATCH_RAY = 400 if MODEL > 0 else 170
 BATCH_PIC = 1
-LEARNING = 5e-4
-NUM_PIC = 20
-DATA_TYPE = "llff"
+LEARNING = 1e-2
+LR_GAMMA = 0.8
+NUM_PIC = 100 if MODEL > 0 else 20
+N_COARSE = 64
+N_FINE = 128
+DATA_TYPE = "sync" if MODEL > 0 else "llff"
 
 
 plt.set_cmap("cividis")
 
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 writer = SummaryWriter()
 device = torch.device("cpu") if not torch.cuda.is_available() else torch.device("cuda:0")
@@ -44,32 +50,56 @@ def seed_everything(seed):
 
 seed_everything(624)
 
+class Activation(nn.Module):
+    def __init__(self):
+        super(Activation, self).__init__()
+
+    def forward(self, x):
+        return torch.abs(x)
+
 class Network(nn.Module):
-    def __init__(self, point_dim = 60, dir_dim = 24, depth = 8, width = 256, batch_size = 8):
+    def __init__(self, point_dim = 60, dir_dim = 24, depth = 8, width = 256, batch_size = 8, layers_skip = [4]):
         super(Network, self).__init__()
         self.depth = depth
         self.width = width
         self.batch_size = batch_size
+        self.layers_skip = layers_skip
 
         # Build layers for space coordinates
-        point_layer = torch.nn.Sequential(torch.nn.Linear(point_dim, width), torch.nn.ReLU(True))
+        self.point_layer = nn.ModuleList([torch.nn.Sequential(torch.nn.Linear(point_dim, width), torch.nn.ReLU(True))])
+        # Choose layers to skip (direct connection of input)
         for i in range(1, depth):
-            point_layer = torch.nn.Sequential(point_layer, torch.nn.Linear(width, width), torch.nn.ReLU(True))
+            if i in layers_skip:
+                self.point_layer.append(torch.nn.Sequential(torch.nn.Linear(width + point_dim, width), torch.nn.ReLU(True)))
+            else:
+                self.point_layer.append(torch.nn.Sequential(torch.nn.Linear(width, width), torch.nn.ReLU(True)))
 
-        self.point_layer = torch.nn.Sequential(point_layer, torch.nn.Linear(width, width))
-        self.sigma_layer = torch.nn.Sequential(torch.nn.Linear(width, 1), torch.nn.Sigmoid())
-
+        # Note: no need in (0, 1) ?
+        self.sigma_layer = torch.nn.Sequential(torch.nn.Linear(width, 1), Activation())
         # Build layers for direction coordinates
-        self.color_layer = torch.nn.Sequential(torch.nn.Linear(width + dir_dim, 3), torch.nn.Sigmoid())
+        self.point_info = torch.nn.Linear(width, width)
+        # get a 128-D feature vector
+        self.dir_info = torch.nn.Sequential(torch.nn.Linear(width + dir_dim, width // 2), torch.nn.ReLU(True))
+        self.color_layer = torch.nn.Sequential(torch.nn.Linear(width // 2, 3), torch.nn.Sigmoid())
 
     def forward(self, num_points, point, dir):
         # Shape as (N_batch, N_points, L+L, N_channel)
         point_long_vec = torch.flatten(point, start_dim = 2)
         dir_long_vec = torch.flatten(dir, start_dim = 2)
-    
-        point_out = self.point_layer(point_long_vec)
+
+        point_in = point_long_vec
+        for i in range(0, self.depth):
+            if i in self.layers_skip:
+                point_out = (self.point_layer[i])(torch.cat((point_in, point_long_vec), dim = -1))
+            else:
+                point_out = (self.point_layer[i])(point_in)
+
+            point_in = point_out
+
         sigma_out = self.sigma_layer(point_out)
-        color_in  = torch.cat((dir_long_vec, point_out), dim = -1)
+        # encoding point information
+        point_info = self.point_info(point_out)
+        color_in  = self.dir_info(torch.cat((dir_long_vec, point_info), dim = -1))
         color_out = self.color_layer(color_in)
         # (N_batch, N_point, 3)
         # (N_batch, N_point, 1)
@@ -163,7 +193,7 @@ class NeRFModel(nn.Module):
         points_wrd = points_wrd[ : , : , :3]
 
         point_enc, dir_enc = self.encoder.forward(num_points, points_wrd, dir_wrd)
-        color, sigma = self.network.forward(num_points,point_enc, dir_enc)
+        color, sigma = self.network.forward(num_points, point_enc, dir_enc)
 
         # output shape: (N_batch, N_points, channel=3/1)
         return color, sigma
@@ -171,7 +201,7 @@ class NeRFModel(nn.Module):
     # Get cdf of coarse sampling, then with its reverse, we use uniform sampling along the horizontal axis
     def resample(self, t_coarse, sigma_coarse):
         # t_coarse: (N_batch, N_c)
-        # sigma_coarse: (N_batch, N_c, 1) -> (N_batch, N_c)\
+        # sigma_coarse: (N_batch, N_c, 1) -> (N_batch, N_c)
         sigma_coarse = sigma_coarse.squeeze()
 
         # (N_batch, N_c)
@@ -181,24 +211,48 @@ class NeRFModel(nn.Module):
         high, _ = torch.max(cdf, dim = 1)
         low, _ = torch.min(cdf, dim = 1)
         delta = t_coarse[0, 1] - t_coarse[0, 0]
+        EPSILON = 1e-5
         # Slope of cdf is not zero, so its inverse is not infinite
         # cdf - cdf = sigma
-        slope = sigma_coarse[ : , 1: ] / delta
-        slope_inv = 1.0 / slope
+        # Add epsilon to avoid zero-division
+        slope_inv = delta / (sigma_coarse[ : , 1: ] + EPSILON)
         high = high.detach().cpu().numpy()
         low = low.detach().cpu().numpy()
         # (N_fine+2, N_batch)
         t_inv = np.linspace(tuple(low), tuple(high), self.num_fine + 2)
         # Init value, drop start and end
         # (N_batch, N_fine)
-        t_inv = torch.tensor(t_inv[1:-1]).to(device).transpose(0, 1).contiguous()
+        t_inv = torch.tensor(t_inv[1 : -1]).to(device).transpose(0, 1).contiguous()
         # indices of t_inv when inserted in cdf
         index_fine = torch.searchsorted(cdf, t_inv) - 1
 
+        # Add an extra column to fit the function, but we will not use it then
+        if len(torch.nonzero(index_fine > self.num_fine - 1)) > 0 or len(torch.nonzero(index_fine < 0)) > 0:
+            print("---------------------------Index: 1--------------------------------")
+            print("----------------------------SIGMA----------------------------------")
+            print(sigma_coarse)
+            np.savetxt("SC" + str(MODEL) + ".txt", np.array(sigma_coarse.detach().cpu()))
+            print("----------------------------T_INV----------------------------------")
+            print(t_inv)
+            np.savetxt("TI" + str(MODEL) + ".txt", np.array(t_inv.detach().cpu()))
+            print("-----------------------------INDEX---------------------------------")
+            print(index_fine)
+            np.savetxt("IF" + str(MODEL) + ".txt", np.array(index_fine.detach().cpu()))
+            print("-----------------------------T_C-----------------------------------")
+            print(t_coarse)
+            np.savetxt("TC" + str(MODEL) + ".txt", np.array(t_coarse.detach().cpu()))
+            print("--------------------------SLOPE_INV--------------------------------")
+            print(slope_inv)
+            np.savetxt("SI" + str(MODEL) + ".txt", np.array(slope_inv.detach().cpu()))
+            print("------------------------------CDF----------------------------------")
+            print(cdf)
+            np.savetxt("CD" + str(MODEL) + ".txt", np.array(cdf.detach().cpu()))
+            exit(0)
+
         lower_t = torch.gather(t_coarse, dim = 1, index = index_fine)
         lower_cdf = torch.gather(cdf, dim = 1, index = index_fine)
-        # Add an extra column to fit the function, but we will not use it then
-        lower_slope = torch.gather(torch.cat((slope_inv, torch.zeros(self.batch_ray, 1).to(device)), dim = 1), dim = 1, index = index_fine)
+        temp = torch.cat((slope_inv, torch.zeros(self.batch_ray, 1).to(device)), dim = 1)
+        lower_slope = torch.gather(temp, dim = 1, index = index_fine)
         t_fine = lower_t + (t_inv - lower_cdf) * lower_slope
 
         return t_fine
@@ -287,8 +341,8 @@ def NeRF_trainer():
     train_dataset = loader.NeRFDataset(root_dir = IMG_DIR, low_res = LOW_RES, transform = None, type = DATA_TYPE)
     train_dataloader = DataLoader(dataset = train_dataset, batch_size = BATCH_PIC, shuffle = True, num_workers = 2)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr = LEARNING, betas = (0.9, 0.999), eps = 1e-7)
-    #scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma = 0.1)
+    optimizer = torch.optim.Adam(model.network.parameters(), lr = LEARNING, betas = (0.9, 0.999), eps = 1e-7)
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones = [150, 1000], gamma = 0.5)
 
     # Check existing checkpoint
     ck_list = glob.glob(MODEL_PATH + "*.pkl")
@@ -347,13 +401,14 @@ def NeRF_trainer():
 
                 loss.backward()
                 optimizer.step()
+                scheduler.step()
                 result[batch_y, batch_x] = C_fine.cpu()
 
                 if(((i % 50) == 0) or (i == num_batches - 1)):
                     print("[BATCH]", i, "/", num_batches, " [LOSS] %.4f "%float(loss),
                           "[T] (%.4f"%float(C_true[0][0]),"%.4f"%float(C_true[0][1]),"%.4f)"%float(C_true[0][2]),
                           "[F] (%.4f"%float(C_fine[0][0]),"%.4f"%float(C_fine[0][1]),"%.4f)"%float(C_fine[0][2]))
-                    plt.imsave("./results/" + str(index) + "/" + str(epoch) + ".jpg", result.detach().numpy())
+                    plt.imsave("./results/" + str(index) + "/" + str(epoch)  + ".jpg", result.detach().numpy())
 
                 # Use tensorboard to record
 
@@ -364,21 +419,17 @@ def NeRF_trainer():
             avg_loss = avg_loss / num_batches
             print("[AVG]", avg_loss)
 
-        #scheduler.step()
         torch.save(model, MODEL_PATH + str(epoch) + ".pkl")
 
-'''
-def test():
-    m = torch.tensor([[ 2.0,  3.0,  4.0],
-                      [ 4.0,  5.0,  6.0]])
-    n = torch.tensor([[ 2,  7,  8],
-                      [10, 11, 12]])
-    print(functional.normalize(m, p = 2.0, dim = 1))
-'''
 
 def test():
-    m = np.load(IMG_DIR + "poses_bounds.npy")
-    print(m[99])
+    m = torch.tensor([[0, 0, 1, 61, 62, 62],
+                      [0, 0, 1, 61, 62, 62],
+                      [0, 0, 1, 61, 62, 62],
+                      [0, 0, 1, 61, 62, 62]])
+    n = torch.tensor([[ 2,  7,  8],
+                      [10, 11, 12]])
+    print(len(torch.nonzero(m[ : , -1] > 127)))
 
 
 if __name__ == "__main__":
