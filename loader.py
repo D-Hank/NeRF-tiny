@@ -1,13 +1,11 @@
-from turtle import back
-from matplotlib.pyplot import axis
 import numpy as np
 import os
 import json
 import numpy as np
 
 from PIL import Image
+import torch
 from torch.utils.data import Dataset
-from torch.utils.data import DataLoader
 
 NEAR_FACTOR = 2.0
 FAR_FACTOR = 6.0
@@ -55,8 +53,53 @@ def convert_npy(root_dir):
 
     np.save(root_dir + "new.npy", dest_trans)
 
+def data_preprocess(root_dir, type):
+    if type == "llff":
+        convert_npy(root_dir)
+    else:
+        create_npy(root_dir)
 
 class NeRFDataset(Dataset):
+    # REFERENCE: https://stackoverflow.com/questions/9166400/convert-rgba-png-to-rgb-with-pil
+    def get_img(self, img_path):
+        image = Image.open(img_path)
+        image.load()
+
+        if self.type == "sync":
+            background = Image.new('RGB', image.size, (255, 255, 255))
+            background.paste(image, mask = image.split()[3]) # 3 is the alpha channel
+
+            image = background
+
+        return np.array(image) / 255.0
+
+    def get_all_pix(self):
+        self.height = int(self.poses_bounds[0][4])
+        self.width = int(self.poses_bounds[0][9])
+        pic_size = self.height * self.width
+        self.num_pix = pic_size * self.pic_num
+
+        all_img = torch.zeros(self.pic_num, self.height, self.width, 3)
+        for i in range(0, self.pic_num):
+            all_img[i] = torch.tensor(self.get_img(self.file_list[i]))
+
+        # [N_pic * H * W, N_channel]
+        #print("PIC0, H0, W0:", all_img[0, 0, 0])
+        #print("PIC0, H0, W1:", all_img[0, 0, 1])
+        #print("PIC0, H1, W0:", all_img[0, 1, 0])
+        #print("PIC1, H0, W0:", all_img[1, 0, 0])
+        all_pix = torch.flatten(all_img, start_dim = 0, end_dim = 2)
+        # Order: this pixel is which pixel among all pixels
+        pix_id = torch.arange(0, self.num_pix, 1).unsqueeze(1)
+        self.bundle = torch.cat((all_pix, pix_id), dim = 1)
+        #print("0:", bundle[0])
+        #print("1:", bundle[1])
+        #print("4032:", bundle[4032])
+        #print("12192768:", bundle[12192768])
+        # Shape: [N_pic * H * W, 3]
+        #print(self.bundle.shape)
+        #exit(0)
+
     def __init__(self, root_dir, low_res = 8, transform = None, type = "sync"):
         self.root_dir = root_dir
         self.low_res = low_res
@@ -65,20 +108,12 @@ class NeRFDataset(Dataset):
         self.pic_num = 0
         self.type = type
 
-        if type == "llff":
-            if os.path.isfile(root_dir + "new.npy") == False:
-                convert_npy(root_dir)
+        if os.path.isfile(root_dir + "new.npy") == False:
+            data_preprocess(root_dir, type)
 
-            if low_res == 8:
-                img_dir = root_dir + "images_8/"
-            else:
-                img_dir = root_dir + "images/"
+        self.poses_bounds = np.load(root_dir + "new.npy")
 
-        if type =="sync":
-            if os.path.isfile(root_dir + "new.npy") == False:
-                create_npy(root_dir)
-
-            img_dir = root_dir + "train/"
+        img_dir = root_dir + ("train/" if type == "sync" else "images/")
 
         self.poses_bounds = np.load(root_dir + "new.npy")
 
@@ -86,30 +121,26 @@ class NeRFDataset(Dataset):
             self.file_list.append(os.path.join(img_dir, file))
             self.pic_num += 1
 
-    # REFERENCE: https://stackoverflow.com/questions/9166400/convert-rgba-png-to-rgb-with-pil
-    def get_img(self, img_path):
-        image = Image.open(img_path)
-        image.load()
-
-        if self.type == "llff":
-            return np.array(image) / 255.0
-
-        else:
-            background = Image.new('RGB', image.size, (255, 255, 255))
-            background.paste(image, mask = image.split()[3]) # 3 is the alpha channel
-
-            return np.array(background) / 255.0
+        self.get_all_pix()
 
     def __len__(self):
-        return self.pic_num
+        return self.num_pix
 
     def __getitem__(self, idx):
-        img_path = self.file_list[idx]
-        img = self.get_img(img_path)
-        poses_bound = self.poses_bounds[idx]
+        pixel = self.bundle[idx]
+        pix_val = pixel[0 : 3]
+        pix_id = pixel[3]
+        # belongs to which pic
+        pic = pix_id % self.pic_num
+        # which pix in this pic
+        id_in_pic = pix_id // self.pic_num
+        # which row
+        row = id_in_pic // self.width
+        # which column
+        column = id_in_pic % self.width
+        poses_bound = self.poses_bounds[pic]
 
-        #print(poses_bounds[idx])
-        return img, poses_bound
+        return row, column, pix_val, poses_bound
 
 '''
 png = Image.open("../nerf_synthetic/lego/train/r_0.png")
