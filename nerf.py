@@ -3,7 +3,6 @@ import time
 import glob
 import random
 import os
-from turtle import forward
 import numpy as np
 import torch
 import torch.nn as nn
@@ -15,19 +14,21 @@ import loader
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-MODEL = 1
+MODEL = 0
 
 IMG_DIR = "../nerf_synthetic/lego/" if MODEL > 0 else "../nerf_llff_data/fern/"
 MODEL_PATH = "./checkpoint/"
 LOW_RES = 1
 EPOCH = 10000
-BATCH_RAY = 2
+BATCH_RAY = 200
 LEARNING = 1e-2
-LR_GAMMA = 0.8
+LR_GAMMA = 0.5
+LR_MILESTONE = [2, 100, 200, 300]
 NUM_PIC = 100 if MODEL > 0 else 20
 N_COARSE = 64
 N_FINE = 128
 DATA_TYPE = "sync" if MODEL > 0 else "llff"
+STEP = 1
 
 
 plt.set_cmap("cividis")
@@ -183,12 +184,13 @@ class NeRFModel(nn.Module):
         dir_cam = functional.normalize(points_scale, p = 2.0, dim = 2)
         # [[x, y, z, 1], [x, y, z, 1], ...], points in batch
         # (N_batch, 4, 4) -> (N_batch, N_points, 4, 4)
+        batch_mat = trans_mat.unsqueeze(1).repeat(1, num_points, 1, 1)
         # (N_batch, N_points, 4) -> (N_batch, N_points, 4, 1)
         # (N_batch, N_points, 4, 4) * (N_batch, N_points, 4, 1) -> (N_batch, N_points, 4, 1) -> (N_batch, N_points, 4)
-        points_wrd = torch.matmul(trans_mat.unsqueeze(1).repeat(num_points), points_cam.unsqueeze(3)).squeeze()
+        points_wrd = torch.matmul(batch_mat, points_cam.unsqueeze(3)).squeeze()
         # (N_batch, N_points, 3)
         # Only rotation for vector
-        dir_wrd = torch.matmul(trans_mat[ : 3, : 3].unsqueeze(1).repeat(num_points), dir_cam.unsqueeze(3)).squeeze()
+        dir_wrd = torch.matmul(batch_mat[ : , : , : 3, : 3], dir_cam.unsqueeze(3)).squeeze()
 
         # [[[R,G,B], [R,G,B], ... * points], ... * batch]
         # (N_batch, N_points, 3)
@@ -277,8 +279,8 @@ class NeRFModel(nn.Module):
     # Local coordinate: [x, y, z] = [right, up, back]
     # Notice: some redundant calculation here!
     def render_rays(self, batch_hor, batch_ver, trans_mat, K_inv, near, far, last = 0.0001):
-        # Shape as (N_batch, N_points)
-        t_coarse = torch.linspace(near, far, self.num_coarse).to(device).unsqueeze(0).repeat(self.batch_ray, 1)
+        # Shape as (N_batch, N_c)
+        t_coarse = torch.tensor(np.linspace(tuple(near), tuple(far), self.num_coarse)).transpose(0, 1).to(device)
         color_co, sigma_co = self.net_out(t_coarse, batch_hor, batch_ver, trans_mat, K_inv, self.num_coarse)
 
         # Shape as (N_batch, N_f)
@@ -286,8 +288,9 @@ class NeRFModel(nn.Module):
         color_fi, sigma_fi = self.net_out(t_fine, batch_hor, batch_ver, trans_mat, K_inv, self.num_fine)
 
         # Note: here t is for camara or world?
+        # far, near: (N_batch)
         # (N_batch, N_c)
-        delta_co = torch.full((self.batch_ray, self.num_coarse), (far - near) / self.num_coarse).to(device)
+        delta_co = ((far - near) / self.num_coarse).unsqueeze(1).repeat(1, self.num_coarse).to(device)
         # (N_batch, N_c) + (N_batch, N_f) -> (N_batch, N_c+N_f) -> (N_batch, N, 1)
         t = torch.cat((t_coarse, t_fine), dim = 1).unsqueeze(2)
         # (N_batch, N_point, N_channel), N_point = N_c + N_f
@@ -336,7 +339,7 @@ def poses_extract(pb_matrix):
     near = pb_matrix[ : , -2]
     far = pb_matrix[ : , -1]
     # [N_batch, 3, 4] + [N_batch, 1, 4] -> [N_batch, 4, 4]
-    c_to_w = torch.cat((pose[ : , : , :-1], torch.tensor([[[0.0, 0.0, 0.0, 1.0]]]).to(device).repeat(BATCH_RAY, 1, 1)), dim = 1)
+    c_to_w = torch.cat((pose[ : , : , :-1], torch.tensor([[[0.0, 0.0, 0.0, 1.0]]]).repeat(BATCH_RAY, 1, 1)), dim = 1)
     # Note: suppose they are the same
     # Notice: for focal: suppose unit length is 1 pixel
     height = pose[0, 0, -1]
@@ -345,12 +348,12 @@ def poses_extract(pb_matrix):
     return c_to_w, height, width, focal, near, far
 
 def NeRF_trainer():
-    model = NeRFModel(num_coarse = 64, num_fine = 128, batch_ray = BATCH_RAY).to(device)
+    model = NeRFModel(num_coarse = N_COARSE, num_fine = N_FINE, batch_ray = BATCH_RAY).to(device)
     train_dataset = loader.NeRFDataset(root_dir = IMG_DIR, low_res = LOW_RES, transform = None, type = DATA_TYPE)
-    train_dataloader = DataLoader(dataset = train_dataset, batch_size = BATCH_RAY, shuffle = False, num_workers = 1)
+    train_dataloader = DataLoader(dataset = train_dataset, batch_size = BATCH_RAY, shuffle = True, num_workers = 1)
 
     optimizer = torch.optim.Adam(model.network.parameters(), lr = LEARNING, betas = (0.9, 0.999), eps = 1e-7)
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones = [150, 1000], gamma = 0.5)
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones = LR_MILESTONE, gamma = LR_GAMMA)
 
     # Check existing checkpoint
     ck_list = glob.glob(MODEL_PATH + "*.pkl")
@@ -368,29 +371,24 @@ def NeRF_trainer():
     for epoch in range(last_epoch + 1, EPOCH, 1):
         print("[EPOCH]", epoch)
         for index, (row, column, pix_val, poses_bound) in enumerate(train_dataloader):
-            print("[IMG]", index, "[AT TIME]", time.asctime(time.localtime(time.time())))
+            #print("[IMG]", index, "[AT TIME]", time.asctime(time.localtime(time.time())))
             # [N_batch, 17]
-            poses_bound = poses_bound.to(device)
+            poses_bound = poses_bound.to(torch.float)
+            c_to_w, height, width, focal, near, far = poses_extract(poses_bound)
+            height = int(height) // LOW_RES
+            width = int(width) // LOW_RES
+            # inverse of intrinsic matrix
+            K_inv = torch.tensor([[1.0 / focal, 0.0, -0.5 * width / focal], [0.0, -1.0 / focal, 0.5 * height / focal], [0.0, 0.0, -1.0]]).to(torch.float).to(device)
+            #result = torch.full((height, width, 3), 1.0)
+
             # Note: here spatial correlation is dropped
             # [N_batch]
             batch_y = row.to(device)
             batch_x = column.to(device)
             # [N_batch, N_channel]
             C_true = pix_val.to(device)
-
-            c_to_w, height, width, focal, near, far = poses_extract(poses_bound)
-            height = int(height) // LOW_RES
-            width = int(width) // LOW_RES
-            print(c_to_w)
-            print(height)
-            print(width)
-            print(focal)
-            print(near)
-            print(far)
-            exit(0)
-            # inverse of intrinsic matrix
-            K_inv = torch.tensor([[1.0 / focal, 0.0, -0.5 * width / focal], [0.0, -1.0 / focal, 0.5 * height / focal], [0.0, 0.0, -1.0]]).to(device)
-            #result = torch.full((height, width, 3), 1.0)
+            # [N_batch, 4, 4]
+            c_to_w = c_to_w.to(device)
 
             avg_loss = 0.0
 
@@ -415,7 +413,7 @@ def NeRF_trainer():
 
             iter += 1
 
-            if (iter % 10) == 0:
+            if (iter % STEP) == 0:
                 print("[BATCH]", index, " [LOSS] %.4f "%float(loss),
                       "[T] (%.4f"%float(C_true[0][0]),"%.4f"%float(C_true[0][1]),"%.4f)"%float(C_true[0][2]),
                       "[F] (%.4f"%float(C_fine[0][0]),"%.4f"%float(C_fine[0][1]),"%.4f)"%float(C_fine[0][2]))
