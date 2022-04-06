@@ -83,22 +83,11 @@ class NeRFDataset(Dataset):
         for i in range(0, self.pic_num):
             all_img[i] = torch.tensor(self.get_img(self.file_list[i]))
 
-        # [N_pic * H * W, N_channel]
-        #print("PIC0, H0, W0:", all_img[0, 0, 0])
-        #print("PIC0, H0, W1:", all_img[0, 0, 1])
-        #print("PIC0, H1, W0:", all_img[0, 1, 0])
-        #print("PIC1, H0, W0:", all_img[1, 0, 0])
         all_pix = torch.flatten(all_img, start_dim = 0, end_dim = 2)
         # Order: this pixel is which pixel among all pixels
         pix_id = torch.arange(0, self.num_pix, 1).unsqueeze(1)
+        # Shape: [N_pic * H * W, 3+1]
         self.bundle = torch.cat((all_pix, pix_id), dim = 1)
-        #print("0:", bundle[0])
-        #print("1:", bundle[1])
-        #print("4032:", bundle[4032])
-        #print("12192768:", bundle[12192768])
-        # Shape: [N_pic * H * W, 3]
-        #print(self.bundle.shape)
-        #exit(0)
 
     def __init__(self, root_dir, low_res = 8, transform = None, type = "sync"):
         self.root_dir = root_dir
@@ -129,7 +118,7 @@ class NeRFDataset(Dataset):
     def __getitem__(self, idx):
         pixel = self.bundle[idx]
         pix_val = pixel[0 : 3]
-        pix_id = pixel[3]
+        pix_id = int(pixel[3])
         # belongs to which pic
         pic = pix_id % self.pic_num
         # which pix in this pic
@@ -141,11 +130,3 @@ class NeRFDataset(Dataset):
         poses_bound = self.poses_bounds[pic]
 
         return row, column, pix_val, poses_bound
-
-'''
-png = Image.open("../nerf_synthetic/lego/train/r_0.png")
-png.load()
-background = Image.new('RGB', png.size, (255, 255, 255))
-background.paste(png, mask=png.split()[3]) # 3 is the alpha channel
-background.save('test.jpg', 'JPEG', quality=80)
-'''

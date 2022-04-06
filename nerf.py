@@ -15,14 +15,13 @@ import loader
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-MODEL = 0
+MODEL = 1
 
 IMG_DIR = "../nerf_synthetic/lego/" if MODEL > 0 else "../nerf_llff_data/fern/"
 MODEL_PATH = "./checkpoint/"
 LOW_RES = 1
 EPOCH = 10000
-BATCH_RAY = 400 if MODEL > 0 else 170
-BATCH_PIC = 1
+BATCH_RAY = 2
 LEARNING = 1e-2
 LR_GAMMA = 0.8
 NUM_PIC = 100 if MODEL > 0 else 20
@@ -163,6 +162,7 @@ class NeRFModel(nn.Module):
     def net_out(self, t_array, batch_x, batch_y, trans_mat, K_inv, num_points):
         # Notice: homogeneous coordinates here!
         # t_array: shape as (N_batch, N_points)
+        # trans_mat: shape as (N_batch, 4, 4)
         # batch_x: shape as (N_batch)
         # xy_hom: shape as (3, N_batch)
         # Notice: get image inverted!
@@ -182,11 +182,13 @@ class NeRFModel(nn.Module):
         # (N_batch, N_points, 3)
         dir_cam = functional.normalize(points_scale, p = 2.0, dim = 2)
         # [[x, y, z, 1], [x, y, z, 1], ...], points in batch
-        # Broadcast multiplication: (N_batch, N_points, 4) * (4, 4) -> (N_batch, N_points, 4)
-        points_wrd = torch.matmul(points_cam, trans_mat.transpose(0, 1))
+        # (N_batch, 4, 4) -> (N_batch, N_points, 4, 4)
+        # (N_batch, N_points, 4) -> (N_batch, N_points, 4, 1)
+        # (N_batch, N_points, 4, 4) * (N_batch, N_points, 4, 1) -> (N_batch, N_points, 4, 1) -> (N_batch, N_points, 4)
+        points_wrd = torch.matmul(trans_mat.unsqueeze(1).repeat(num_points), points_cam.unsqueeze(3)).squeeze()
         # (N_batch, N_points, 3)
         # Only rotation for vector
-        dir_wrd = torch.matmul(dir_cam, trans_mat[ : 3, : 3].transpose(0, 1))
+        dir_wrd = torch.matmul(trans_mat[ : 3, : 3].unsqueeze(1).repeat(num_points), dir_cam.unsqueeze(3)).squeeze()
 
         # [[[R,G,B], [R,G,B], ... * points], ... * batch]
         # (N_batch, N_points, 3)
@@ -321,25 +323,31 @@ class NeRFModel(nn.Module):
     def forward(self, batch_hor, batch_ver, trans_mat, K_inv, near, far):
         # In picture: [x, y] = [right, down]
         # K: intrinsic matrix (K_inv)
-        trans_mat = trans_mat.to(device)
-        K_inv = K_inv.to(device)
+        #trans_mat = trans_mat.to(device)
+        #K_inv = K_inv.to(device)
         return self.render_rays(batch_hor, batch_ver, trans_mat, K_inv, near, far)
 
 
 def poses_extract(pb_matrix):
-    pose = pb_matrix[ :-2].reshape(3, 5)
-    c_to_w = torch.tensor(pose[ : , :-1]).to(torch.float)
+    # pb shape: [N_batch, 17]
+    # [N_batch, 3, 5]
+    pose = pb_matrix[ : , :-2].reshape(-1, 3, 5)
+    # Notice: near, far are not the same among pixels
+    near = pb_matrix[ : , -2]
+    far = pb_matrix[ : , -1]
+    # [N_batch, 3, 4] + [N_batch, 1, 4] -> [N_batch, 4, 4]
+    c_to_w = torch.cat((pose[ : , : , :-1], torch.tensor([[[0.0, 0.0, 0.0, 1.0]]]).to(device).repeat(BATCH_RAY, 1, 1)), dim = 1)
+    # Note: suppose they are the same
     # Notice: for focal: suppose unit length is 1 pixel
-    hwf = pose[ : , -1]
-    height, width, focal = hwf
-    near, far = pb_matrix[-2: ]
-    c_to_w = torch.cat((torch.as_tensor(c_to_w).clone(), torch.tensor([[0.0, 0.0, 0.0, 1.0]])), dim = 0)
+    height = pose[0, 0, -1]
+    width = pose[0, 1, -1]
+    focal = pose[0, 2, -1]
     return c_to_w, height, width, focal, near, far
 
 def NeRF_trainer():
     model = NeRFModel(num_coarse = 64, num_fine = 128, batch_ray = BATCH_RAY).to(device)
     train_dataset = loader.NeRFDataset(root_dir = IMG_DIR, low_res = LOW_RES, transform = None, type = DATA_TYPE)
-    train_dataloader = DataLoader(dataset = train_dataset, batch_size = BATCH_PIC, shuffle = True, num_workers = 2)
+    train_dataloader = DataLoader(dataset = train_dataset, batch_size = BATCH_RAY, shuffle = False, num_workers = 1)
 
     optimizer = torch.optim.Adam(model.network.parameters(), lr = LEARNING, betas = (0.9, 0.999), eps = 1e-7)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones = [150, 1000], gamma = 0.5)
@@ -356,70 +364,68 @@ def NeRF_trainer():
         print("Last epoch:", last_epoch)
         model = torch.load(MODEL_PATH + str(last_epoch) + ".pkl")
 
+    iter = 0
     for epoch in range(last_epoch + 1, EPOCH, 1):
         print("[EPOCH]", epoch)
-        for index, (img, poses_bounds) in enumerate(train_dataloader):
+        for index, (row, column, pix_val, poses_bound) in enumerate(train_dataloader):
             print("[IMG]", index, "[AT TIME]", time.asctime(time.localtime(time.time())))
-            poses_bounds = poses_bounds.numpy()
-            poses_bounds = poses_bounds[0]
-            # [PIC, HEIGHT, WIDTH, CHANNEL]
-            img = img[0].to(device)
-            #print(img)
-            c_to_w, height, width, focal, near, far = poses_extract(poses_bounds)
+            # [N_batch, 17]
+            poses_bound = poses_bound.to(device)
+            # Note: here spatial correlation is dropped
+            # [N_batch]
+            batch_y = row.to(device)
+            batch_x = column.to(device)
+            # [N_batch, N_channel]
+            C_true = pix_val.to(device)
+
+            c_to_w, height, width, focal, near, far = poses_extract(poses_bound)
             height = int(height) // LOW_RES
             width = int(width) // LOW_RES
+            print(c_to_w)
+            print(height)
+            print(width)
+            print(focal)
+            print(near)
+            print(far)
+            exit(0)
             # inverse of intrinsic matrix
-            K_inv = torch.tensor([[1.0 / focal, 0.0, -0.5 * width / focal], [0.0, -1.0 / focal, 0.5 * height / focal], [0.0, 0.0, -1.0]]).to(torch.float)
-            result = torch.full((height, width, 3), 1.0)
-
-            # randomize x and y
-            # Note: here spatial correlation is dropped
-            x, y = torch.meshgrid(torch.arange(0, width, 1), torch.arange(0, height, 1), indexing = 'xy')
-            num_batches = height * width // BATCH_RAY
-            trunc_pix = num_batches * BATCH_RAY
-            xy = torch.cat(((x.to(device).flatten()[0 : trunc_pix]).unsqueeze(0), (y.to(device).flatten()[0 : trunc_pix]).unsqueeze(0)), dim = 0)
-            x, y = xy[ : , torch.randperm(trunc_pix)]
+            K_inv = torch.tensor([[1.0 / focal, 0.0, -0.5 * width / focal], [0.0, -1.0 / focal, 0.5 * height / focal], [0.0, 0.0, -1.0]]).to(device)
+            #result = torch.full((height, width, 3), 1.0)
 
             avg_loss = 0.0
 
-            for i in range(0, num_batches):
-                start_pix = i * BATCH_RAY
-                end_pix = (i + 1) * BATCH_RAY
-                batch_x = x[start_pix : end_pix]
-                batch_y = y[start_pix : end_pix]
-                # For ray batch
-                optimizer.zero_grad()
-                model.train()
-                # ver: 378, hor: 504
-                # [BATCH, 3]
-                C_true = img[batch_y, batch_x]
-                #print(C_true)
-                C_coarse, C_fine = model(batch_x, batch_y, c_to_w, K_inv, near, far)
-                #print(C_coarse)
-                loss = model.ray_loss(C_coarse, C_fine, C_true)
-                avg_loss += float(loss)
+            # For ray batch
+            optimizer.zero_grad()
+            model.train()
+            # ver: 3024, hor: 4032
+            C_coarse, C_fine = model(batch_x, batch_y, c_to_w, K_inv, near, far)
+            #print(C_coarse)
+            loss = model.ray_loss(C_coarse, C_fine, C_true)
+            avg_loss += float(loss)
 
-                loss.backward()
-                optimizer.step()
-                scheduler.step()
-                result[batch_y, batch_x] = C_fine.cpu()
+            loss.backward()
+            optimizer.step()
+            #scheduler.step()
+            #result[batch_y, batch_x] = C_fine.cpu()
 
-                if(((i % 50) == 0) or (i == num_batches - 1)):
-                    print("[BATCH]", i, "/", num_batches, " [LOSS] %.4f "%float(loss),
-                          "[T] (%.4f"%float(C_true[0][0]),"%.4f"%float(C_true[0][1]),"%.4f)"%float(C_true[0][2]),
-                          "[F] (%.4f"%float(C_fine[0][0]),"%.4f"%float(C_fine[0][1]),"%.4f)"%float(C_fine[0][2]))
-                    plt.imsave("./results/" + str(index) + "/" + str(epoch)  + ".jpg", result.detach().numpy())
+            # Use tensorboard to record
+            writer.add_scalar("loss/train", loss, iter)
+            writer.add_scalar("lr/train", optimizer.state_dict()['param_groups'][0]['lr'], iter)
+            writer.flush()
 
-                # Use tensorboard to record
+            iter += 1
 
-                writer.add_scalar("loss/train", loss, epoch * NUM_PIC * num_batches + index * num_batches + i)
-                writer.add_scalar("lr/train", optimizer.state_dict()['param_groups'][0]['lr'], epoch * NUM_PIC * num_batches + index * num_batches + i)
-                writer.flush()
+            if (iter % 10) == 0:
+                print("[BATCH]", index, " [LOSS] %.4f "%float(loss),
+                      "[T] (%.4f"%float(C_true[0][0]),"%.4f"%float(C_true[0][1]),"%.4f)"%float(C_true[0][2]),
+                      "[F] (%.4f"%float(C_fine[0][0]),"%.4f"%float(C_fine[0][1]),"%.4f)"%float(C_fine[0][2]))
 
-            avg_loss = avg_loss / num_batches
-            print("[AVG]", avg_loss)
+            if (iter % (height * width)) == 0:
+                print("[AVG] %.4f"%avg_loss)
+                avg_loss = 0.0
 
-        torch.save(model, MODEL_PATH + str(epoch) + ".pkl")
+
+        #torch.save(model, MODEL_PATH + str(epoch) + ".pkl")
 
 
 def test():
