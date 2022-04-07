@@ -1,5 +1,4 @@
 import math
-import time
 import glob
 import random
 import os
@@ -11,35 +10,31 @@ import matplotlib.pyplot as plt
 
 import loader
 
+from tqdm import tqdm
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 MODEL = 0
 
+GPU = 0
 IMG_DIR = "../nerf_synthetic/lego/" if MODEL > 0 else "../nerf_llff_data/fern/"
 MODEL_PATH = "./checkpoint/"
 LOW_RES = 1
 EPOCH = 10000
-BATCH_RAY = 200
-LEARNING = 1e-2
-LR_GAMMA = 0.5
-LR_MILESTONE = [2, 100, 200, 300]
+BATCH_RAY = 400
+LEARNING = 1e-3
+LR_GAMMA = 0.1
+LR_MILESTONE = [10, 200]
 NUM_PIC = 100 if MODEL > 0 else 20
 N_COARSE = 64
 N_FINE = 128
 DATA_TYPE = "sync" if MODEL > 0 else "llff"
-STEP = 1
+STEP = 100
+DECAY_END = 200000
 
+writer = None
+device = None
 
-plt.set_cmap("cividis")
-
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-
-writer = SummaryWriter()
-device = torch.device("cpu") if not torch.cuda.is_available() else torch.device("cuda:0")
-print("Using device", device)
 
 def seed_everything(seed):
     os.environ["PL_GLOBAL_SEED"] = str(seed)
@@ -75,7 +70,7 @@ class Network(nn.Module):
                 self.point_layer.append(torch.nn.Sequential(torch.nn.Linear(width, width), torch.nn.ReLU(True)))
 
         # Note: no need in (0, 1) ?
-        self.sigma_layer = torch.nn.Sequential(torch.nn.Linear(width, 1), Activation())
+        self.sigma_layer = torch.nn.Sequential(torch.nn.Linear(width, 1), torch.nn.Softplus())
         # Build layers for direction coordinates
         self.point_info = torch.nn.Linear(width, width)
         # get a 128-D feature vector
@@ -215,7 +210,7 @@ class NeRFModel(nn.Module):
         high, _ = torch.max(cdf, dim = 1)
         low, _ = torch.min(cdf, dim = 1)
         delta = t_coarse[0, 1] - t_coarse[0, 0]
-        EPSILON = 1e-5
+        EPSILON = 1e-7
         # Slope of cdf is not zero, so its inverse is not infinite
         # cdf - cdf = sigma
         # Add epsilon to avoid zero-division
@@ -233,24 +228,6 @@ class NeRFModel(nn.Module):
         # Add an extra column to fit the function, but we will not use it then
         if len(torch.nonzero(index_fine > self.num_fine - 1)) > 0 or len(torch.nonzero(index_fine < 0)) > 0:
             print("---------------------------Index: 1--------------------------------")
-            print("----------------------------SIGMA----------------------------------")
-            print(sigma_coarse)
-            np.savetxt("SC" + str(MODEL) + ".txt", np.array(sigma_coarse.detach().cpu()))
-            print("----------------------------T_INV----------------------------------")
-            print(t_inv)
-            np.savetxt("TI" + str(MODEL) + ".txt", np.array(t_inv.detach().cpu()))
-            print("-----------------------------INDEX---------------------------------")
-            print(index_fine)
-            np.savetxt("IF" + str(MODEL) + ".txt", np.array(index_fine.detach().cpu()))
-            print("-----------------------------T_C-----------------------------------")
-            print(t_coarse)
-            np.savetxt("TC" + str(MODEL) + ".txt", np.array(t_coarse.detach().cpu()))
-            print("--------------------------SLOPE_INV--------------------------------")
-            print(slope_inv)
-            np.savetxt("SI" + str(MODEL) + ".txt", np.array(slope_inv.detach().cpu()))
-            print("------------------------------CDF----------------------------------")
-            print(cdf)
-            np.savetxt("CD" + str(MODEL) + ".txt", np.array(cdf.detach().cpu()))
             exit(0)
 
         lower_t = torch.gather(t_coarse, dim = 1, index = index_fine)
@@ -331,111 +308,161 @@ class NeRFModel(nn.Module):
         return self.render_rays(batch_hor, batch_ver, trans_mat, K_inv, near, far)
 
 
-def poses_extract(pb_matrix):
-    # pb shape: [N_batch, 17]
-    # [N_batch, 3, 5]
-    pose = pb_matrix[ : , :-2].reshape(-1, 3, 5)
-    # Notice: near, far are not the same among pixels
-    near = pb_matrix[ : , -2]
-    far = pb_matrix[ : , -1]
-    # [N_batch, 3, 4] + [N_batch, 1, 4] -> [N_batch, 4, 4]
-    c_to_w = torch.cat((pose[ : , : , :-1], torch.tensor([[[0.0, 0.0, 0.0, 1.0]]]).repeat(BATCH_RAY, 1, 1)), dim = 1)
-    # Note: suppose they are the same
-    # Notice: for focal: suppose unit length is 1 pixel
-    height = pose[0, 0, -1]
-    width = pose[0, 1, -1]
-    focal = pose[0, 2, -1]
-    return c_to_w, height, width, focal, near, far
+class NeRFRunner():
+    def __init__(
+        self,
+        gpu = GPU,
+        img_dir = IMG_DIR,
+        ckpt_path = MODEL_PATH,
+        low_res = LOW_RES,
+        epoch = EPOCH,
+        batch_ray = BATCH_RAY,
+        learning = LEARNING,
+        lr_gamma = LR_GAMMA,
+        lr_milestone = LR_MILESTONE,
+        n_coarse = N_COARSE,
+        n_fine = N_FINE,
+        data_type = DATA_TYPE,
+        step = STEP,
+        decay_end = DECAY_END,
+        sched = "EXP"):
 
-def NeRF_trainer():
-    model = NeRFModel(num_coarse = N_COARSE, num_fine = N_FINE, batch_ray = BATCH_RAY).to(device)
-    train_dataset = loader.NeRFDataset(root_dir = IMG_DIR, low_res = LOW_RES, transform = None, type = DATA_TYPE)
-    train_dataloader = DataLoader(dataset = train_dataset, batch_size = BATCH_RAY, shuffle = True, num_workers = 1)
+        # -----------------------------------GLOBAL-----------------------------------
+        plt.set_cmap("cividis")
 
-    optimizer = torch.optim.Adam(model.network.parameters(), lr = LEARNING, betas = (0.9, 0.999), eps = 1e-7)
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones = LR_MILESTONE, gamma = LR_GAMMA)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        #os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
-    # Check existing checkpoint
-    ck_list = glob.glob(MODEL_PATH + "*.pkl")
-    last_epoch = -1
-    for file in ck_list:
-        ck = file.split("\\")[-1]
-        ep = int(ck[ : -4])
-        last_epoch = max(last_epoch, ep)
+        global device, writer
 
-    if ck_list:
-        print("Last epoch:", last_epoch)
-        model = torch.load(MODEL_PATH + str(last_epoch) + ".pkl")
+        writer = SummaryWriter()
+        device = torch.device("cuda:" + str(gpu)) if torch.cuda.is_available() else torch.device("cpu")
+        print("Using device", device)
 
-    iter = 0
-    for epoch in range(last_epoch + 1, EPOCH, 1):
-        print("[EPOCH]", epoch)
-        for index, (row, column, pix_val, poses_bound) in enumerate(train_dataloader):
-            #print("[IMG]", index, "[AT TIME]", time.asctime(time.localtime(time.time())))
-            # [N_batch, 17]
-            poses_bound = poses_bound.to(torch.float)
-            c_to_w, height, width, focal, near, far = poses_extract(poses_bound)
-            height = int(height) // LOW_RES
-            width = int(width) // LOW_RES
-            # inverse of intrinsic matrix
-            K_inv = torch.tensor([[1.0 / focal, 0.0, -0.5 * width / focal], [0.0, -1.0 / focal, 0.5 * height / focal], [0.0, 0.0, -1.0]]).to(torch.float).to(device)
-            #result = torch.full((height, width, 3), 1.0)
+        self.model = NeRFModel(num_coarse = n_coarse, num_fine = n_fine, batch_ray = batch_ray).to(device)
+        self.ckpt_path = ckpt_path
+        self.low_res = low_res
+        self.epoch = epoch
+        self.batch_ray = batch_ray
+        self.step = step
+        self.decay_end = decay_end
 
-            # Note: here spatial correlation is dropped
-            # [N_batch]
-            batch_y = row.to(device)
-            batch_x = column.to(device)
-            # [N_batch, N_channel]
-            C_true = pix_val.to(device)
-            # [N_batch, 4, 4]
-            c_to_w = c_to_w.to(device)
+        # Check existing checkpoint
+        ck_list = glob.glob(ckpt_path + "*.pkl")
+        last_epoch = -1
+        for file in ck_list:
+            ck = file.split("\\")[-1]
+            ep = int(ck[ : -4])
+            last_epoch = max(last_epoch, ep)
 
-            avg_loss = 0.0
+        if ck_list:
+            print("Last epoch:", last_epoch)
+            self.model = torch.load(ckpt_path + str(last_epoch) + ".pkl")
 
-            # For ray batch
-            optimizer.zero_grad()
-            model.train()
-            # ver: 3024, hor: 4032
-            C_coarse, C_fine = model(batch_x, batch_y, c_to_w, K_inv, near, far)
-            #print(C_coarse)
-            loss = model.ray_loss(C_coarse, C_fine, C_true)
-            avg_loss += float(loss)
+        self.last_epoch = last_epoch
 
-            loss.backward()
-            optimizer.step()
-            #scheduler.step()
-            #result[batch_y, batch_x] = C_fine.cpu()
+        # -----------------------------------TRAIN-------------------------------------
+        self.train_dataset = loader.NeRFDataset(root_dir = img_dir, low_res = low_res, transform = None, type = data_type)
+        self.train_dataloader = DataLoader(dataset = self.train_dataset, batch_size = batch_ray, shuffle = True, num_workers = 2, drop_last = True)
+        self.optimizer = torch.optim.Adam(self.model.network.parameters(), lr = learning, betas = (0.9, 0.999), eps = 1e-7)
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda = lambda iter: lr_gamma ** (iter / decay_end)) if sched == "EXP" else \
+                         torch.optim.lr_scheduler.MultiStepLR(self.optimizer, lr_milestone, lr_gamma)
 
-            # Use tensorboard to record
-            writer.add_scalar("loss/train", loss, iter)
-            writer.add_scalar("lr/train", optimizer.state_dict()['param_groups'][0]['lr'], iter)
-            writer.flush()
+        self.height = self.train_dataset.height
+        self.width = self.train_dataset.width
+        self.focal = self.train_dataset.focal
+        self.num_pic = self.train_dataset.pic_num
 
-            iter += 1
+        # ----------------------------------XXX----------------------------------------
 
-            if (iter % STEP) == 0:
-                print("[BATCH]", index, " [LOSS] %.4f "%float(loss),
-                      "[T] (%.4f"%float(C_true[0][0]),"%.4f"%float(C_true[0][1]),"%.4f)"%float(C_true[0][2]),
-                      "[F] (%.4f"%float(C_fine[0][0]),"%.4f"%float(C_fine[0][1]),"%.4f)"%float(C_fine[0][2]))
 
-            if (iter % (height * width)) == 0:
-                print("[AVG] %.4f"%avg_loss)
+    def poses_extract(self, pb_matrix):
+        # pb shape: [N_batch, 17]
+        # [N_batch, 3, 5]
+        pose = pb_matrix[ : , :-2].reshape(-1, 3, 5)
+        # Notice: near, far are not the same among pixels
+        near = pb_matrix[ : , -2]
+        far = pb_matrix[ : , -1]
+        # [N_batch, 3, 4] + [N_batch, 1, 4] -> [N_batch, 4, 4]
+        c_to_w = torch.cat((pose[ : , : , :-1], torch.tensor([[[0.0, 0.0, 0.0, 1.0]]]).repeat(self.batch_ray, 1, 1)), dim = 1)
+        # Note: suppose they are the same
+        # Notice: for focal: suppose unit length is 1 pixel
+        height = pose[0, 0, -1]
+        width = pose[0, 1, -1]
+        focal = pose[0, 2, -1]
+        return c_to_w, height, width, focal, near, far
+
+    def trainer(self):
+        model = self.model
+        train_dataloader = self.train_dataloader
+
+        optimizer = self.optimizer
+        scheduler = self.scheduler
+
+        # Suppose they are the same for all images
+        height = self.height
+        width = self.width
+        focal = self.focal
+        # inverse of intrinsic matrix
+        K_inv = torch.tensor([[1.0 / focal, 0.0, -0.5 * width / focal], [0.0, -1.0 / focal, 0.5 * height / focal], [0.0, 0.0, -1.0]]).to(torch.float).to(device)
+
+        last_epoch = self.last_epoch
+        epoch = self.epoch
+        step = self.step
+        iter = 0
+        for epoch in range(last_epoch + 1, epoch, 1):
+            print("[EPOCH]", epoch)
+            loop = tqdm(enumerate(train_dataloader), total = len(train_dataloader))
+            for index, (row, column, pix_val, poses_bound) in loop:
+                #print("[IMG]", index, "[AT TIME]", time.asctime(time.localtime(time.time())))
+                # [N_batch, 17]
+                poses_bound = poses_bound.to(torch.float)
+                c_to_w, _, __, ___, near, far = self.poses_extract(poses_bound)
+                #result = torch.full((height, width, 3), 1.0)
+
+                # Note: here spatial correlation is dropped
+                # [N_batch]
+                batch_y = row.to(device)
+                batch_x = column.to(device)
+                # [N_batch, N_channel]
+                C_true = pix_val.to(device)
+                # [N_batch, 4, 4]
+                c_to_w = c_to_w.to(device)
+
                 avg_loss = 0.0
 
+                # For ray batch
+                optimizer.zero_grad()
+                model.train()
+                # ver: 3024, hor: 4032
+                C_coarse, C_fine = model(batch_x, batch_y, c_to_w, K_inv, near, far)
+                #print(C_coarse)
+                loss = model.ray_loss(C_coarse, C_fine, C_true)
+                avg_loss += float(loss)
 
-        #torch.save(model, MODEL_PATH + str(epoch) + ".pkl")
+                loss.backward()
+                optimizer.step()
+
+                if iter < self.decay_end:
+                    scheduler.step()
+                #result[batch_y, batch_x] = C_fine.cpu()
+
+                # Use tensorboard to record
+                writer.add_scalar("loss/train", loss, iter)
+                writer.add_scalar("lr/train", optimizer.state_dict()['param_groups'][0]['lr'], iter)
+                writer.flush()
+
+                iter += 1
+
+                if (iter % step) == 0:
+                    print("\n[ITER]", index, " [LOSS] %.4f "%float(loss),
+                        "[T] (%.4f"%float(C_true[0][0]),"%.4f"%float(C_true[0][1]),"%.4f)"%float(C_true[0][2]),
+                        "[F] (%.4f"%float(C_fine[0][0]),"%.4f"%float(C_fine[0][1]),"%.4f)"%float(C_fine[0][2]))
+
+                if (iter % (height * width)) == 0:
+                    print("\n[AVG] %.4f"%avg_loss)
+                    avg_loss = 0.0
 
 
-def test():
-    m = torch.tensor([[0, 0, 1, 61, 62, 62],
-                      [0, 0, 1, 61, 62, 62],
-                      [0, 0, 1, 61, 62, 62],
-                      [0, 0, 1, 61, 62, 62]])
-    n = torch.tensor([[ 2,  7,  8],
-                      [10, 11, 12]])
-    print(len(torch.nonzero(m[ : , -1] > 127)))
-
-
-if __name__ == "__main__":
-    NeRF_trainer()
-    #test()
+            torch.save(model, self.ckpt_path + str(epoch) + ".pkl")

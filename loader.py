@@ -1,7 +1,6 @@
 import numpy as np
 import os
 import json
-import numpy as np
 
 from PIL import Image
 import torch
@@ -76,6 +75,7 @@ class NeRFDataset(Dataset):
     def get_all_pix(self):
         self.height = int(self.poses_bounds[0][4])
         self.width = int(self.poses_bounds[0][9])
+        self.focal = self.poses_bounds[0][14]
         pic_size = self.height * self.width
         self.num_pix = pic_size * self.pic_num
 
