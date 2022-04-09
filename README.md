@@ -1,2 +1,2 @@
-# NeRF-reproduce
-A simple pytorch implementation of NeRF
+# NeRF-tiny
+A tiny pytorch implementation of NeRF
