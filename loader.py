@@ -84,11 +84,8 @@ class NeRFDataset(Dataset):
             all_img[i] = torch.tensor(self.get_img(self.file_list[i]))
 
         # (N_pic, height, width, 3) -> (N_pic * H * W, 3)
-        all_pix = torch.flatten(all_img, start_dim = 0, end_dim = 2)
-        # Order: this pixel is which pixel among all pixels
-        pix_id = torch.arange(0, self.num_pix, 1).unsqueeze(1)
-        # Shape: [N_pic * H * W, 3+1]
-        self.bundle = torch.cat((all_pix, pix_id), dim = 1)
+        # with: W -> H -> N_pic
+        self.all_pix = torch.flatten(all_img, start_dim = 0, end_dim = 2)
 
     def __init__(self, root_dir, low_res = 8, transform = None, type = "sync"):
         self.root_dir = root_dir
@@ -117,13 +114,13 @@ class NeRFDataset(Dataset):
         return self.num_pix
 
     def __getitem__(self, idx):
-        pixel = self.bundle[idx]
+        # idx: this pixel is which pixel among all pixels
+        pixel = self.all_pix[idx]
         pix_val = pixel[0 : 3]
-        pix_id = int(pixel[3])
         # belongs to which pic
-        pic = pix_id // self.pic_size
+        pic = idx // self.pic_size
         # which pix in this pic
-        id_in_pic = pix_id % self.pic_size
+        id_in_pic = idx % self.pic_size
         # which row
         row = id_in_pic // self.width
         # which column
@@ -131,3 +128,6 @@ class NeRFDataset(Dataset):
         poses_bound = self.poses_bounds[pic]
 
         return row, column, pix_val, poses_bound
+
+    def test(self, idx):
+        return self.__getitem__(idx)
