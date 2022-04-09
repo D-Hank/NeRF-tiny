@@ -1,2 +1,2 @@
 # NeRF-tiny
-A tiny pytorch implementation of NeRF
+A simple pytorch implementation of NeRF
