@@ -1,5 +1,6 @@
 import math
 import glob
+import time
 import random
 import os
 import numpy as np
@@ -18,9 +19,10 @@ MODEL = 0
 
 GPU = 0
 IMG_DIR = "../nerf_synthetic/lego/" if MODEL > 0 else "../nerf_llff_data/fern/"
+RESULTS_PATH = "./results/"
 MODEL_PATH = "./checkpoint/"
 LOW_RES = 1
-EPOCH = 10000
+TOTAL_ITER = 100000
 BATCH_RAY = 400
 LEARNING = 1e-3
 LR_GAMMA = 0.1
@@ -313,9 +315,10 @@ class NeRFRunner():
         self,
         gpu = GPU,
         img_dir = IMG_DIR,
+        results_path = RESULTS_PATH,
         ckpt_path = MODEL_PATH,
         low_res = LOW_RES,
-        epoch = EPOCH,
+        total_iter = TOTAL_ITER,
         batch_ray = BATCH_RAY,
         learning = LEARNING,
         lr_gamma = LR_GAMMA,
@@ -325,7 +328,8 @@ class NeRFRunner():
         data_type = DATA_TYPE,
         step = STEP,
         decay_end = DECAY_END,
-        sched = "EXP"):
+        sched = "EXP",
+        continu = False):
 
         # -----------------------------------GLOBAL-----------------------------------
         plt.set_cmap("cividis")
@@ -341,30 +345,34 @@ class NeRFRunner():
         print("Using device", device)
 
         self.model = NeRFModel(num_coarse = n_coarse, num_fine = n_fine, batch_ray = batch_ray).to(device)
+        self.results_path = results_path
         self.ckpt_path = ckpt_path
         self.low_res = low_res
-        self.epoch = epoch
+        self.total_iter = total_iter
         self.batch_ray = batch_ray
         self.step = step
         self.decay_end = decay_end
 
         # Check existing checkpoint
+        # Notice: repeated data are possible!
         ck_list = glob.glob(ckpt_path + "*.pkl")
-        last_epoch = -1
-        for file in ck_list:
-            ck = file.split("\\")[-1]
-            ep = int(ck[ : -4])
-            last_epoch = max(last_epoch, ep)
+        last_iter = -1
+        if continu == True and ck_list:
+            for file in ck_list:
+                ck = file.split("_")[-1]
+                it = int(ck[ : -4])
+                if it > last_iter:
+                    last_iter = it
+                    last_ckpt = file
 
-        if ck_list:
-            print("Last epoch:", last_epoch)
-            self.model = torch.load(ckpt_path + str(last_epoch) + ".pkl")
+            print("Last iter:", last_iter)
+            self.model = torch.load(last_ckpt)
 
-        self.last_epoch = last_epoch
+        self.last_iter = last_iter
 
         # -----------------------------------TRAIN-------------------------------------
         self.train_dataset = loader.NeRFDataset(root_dir = img_dir, low_res = low_res, transform = None, type = data_type)
-        self.train_dataloader = DataLoader(dataset = self.train_dataset, batch_size = batch_ray, shuffle = True, num_workers = 2, drop_last = True)
+        self.train_dataloader = DataLoader(dataset = self.train_dataset, batch_size = batch_ray, shuffle = True, num_workers = 4, drop_last = True)
         self.optimizer = torch.optim.Adam(self.model.network.parameters(), lr = learning, betas = (0.9, 0.999), eps = 1e-7)
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda = lambda iter: lr_gamma ** (iter / decay_end)) if sched == "EXP" else \
                          torch.optim.lr_scheduler.MultiStepLR(self.optimizer, lr_milestone, lr_gamma)
@@ -374,7 +382,9 @@ class NeRFRunner():
         self.focal = self.train_dataset.focal
         self.num_pic = self.train_dataset.pic_num
 
-        # ----------------------------------XXX----------------------------------------
+        # ----------------------------------DISPLAY-------------------------------------
+        #self.disp_dataset = loader.NeRFDataset(root_dir = img_dir, low_res = low_res, transform = None, type = data_type)
+        #self.disp_dataloader = DataLoader(dataset = self.train_dataset, batch_size = )
 
 
     def poses_extract(self, pb_matrix):
@@ -394,6 +404,8 @@ class NeRFRunner():
         return c_to_w, height, width, focal, near, far
 
     def trainer(self):
+        start_time = time.strftime("%m-%d-%H-%M-%S", time.localtime())
+        print("Start training at time: ", start_time)
         model = self.model
         train_dataloader = self.train_dataloader
 
@@ -407,19 +419,18 @@ class NeRFRunner():
         # inverse of intrinsic matrix
         K_inv = torch.tensor([[1.0 / focal, 0.0, -0.5 * width / focal], [0.0, -1.0 / focal, 0.5 * height / focal], [0.0, 0.0, -1.0]]).to(torch.float).to(device)
 
-        last_epoch = self.last_epoch
-        epoch = self.epoch
         step = self.step
-        iter = 0
-        for epoch in range(last_epoch + 1, epoch, 1):
-            print("[EPOCH]", epoch)
+        end_iter = self.total_iter
+        iter = self.last_iter + 1
+        while (iter < end_iter):
+            print("\n[ITER]\n", iter)
             loop = tqdm(enumerate(train_dataloader), total = len(train_dataloader))
-            for index, (row, column, pix_val, poses_bound) in loop:
-                #print("[IMG]", index, "[AT TIME]", time.asctime(time.localtime(time.time())))
+            # Save pic0 as a view
+            result = torch.full((height, width, 3), 1.0)
+            for index, (row, column, pix_val, poses_bound, pic) in loop:
                 # [N_batch, 17]
                 poses_bound = poses_bound.to(torch.float)
                 c_to_w, _, __, ___, near, far = self.poses_extract(poses_bound)
-                #result = torch.full((height, width, 3), 1.0)
 
                 # Note: here spatial correlation is dropped
                 # [N_batch]
@@ -430,8 +441,6 @@ class NeRFRunner():
                 # [N_batch, 4, 4]
                 c_to_w = c_to_w.to(device)
 
-                avg_loss = 0.0
-
                 # For ray batch
                 optimizer.zero_grad()
                 model.train()
@@ -439,14 +448,12 @@ class NeRFRunner():
                 C_coarse, C_fine = model(batch_x, batch_y, c_to_w, K_inv, near, far)
                 #print(C_coarse)
                 loss = model.ray_loss(C_coarse, C_fine, C_true)
-                avg_loss += float(loss)
 
                 loss.backward()
                 optimizer.step()
 
                 if iter < self.decay_end:
                     scheduler.step()
-                #result[batch_y, batch_x] = C_fine.cpu()
 
                 # Use tensorboard to record
                 writer.add_scalar("loss/train", loss, iter)
@@ -455,14 +462,16 @@ class NeRFRunner():
 
                 iter += 1
 
+                origin = result[batch_y, batch_x]
+                result[batch_y, batch_x] = torch.where(pic.unsqueeze(1) < 0.5, C_fine.cpu(), origin)
+
                 if (iter % step) == 0:
-                    print("\n[ITER]", index, " [LOSS] %.4f "%float(loss),
+                    print("\n[INDEX]", index, " [LOSS] %.4f "%float(loss),
                         "[T] (%.4f"%float(C_true[0][0]),"%.4f"%float(C_true[0][1]),"%.4f)"%float(C_true[0][2]),
                         "[F] (%.4f"%float(C_fine[0][0]),"%.4f"%float(C_fine[0][1]),"%.4f)"%float(C_fine[0][2]))
 
-                if (iter % (height * width)) == 0:
-                    print("\n[AVG] %.4f"%avg_loss)
-                    avg_loss = 0.0
+                    plt.imsave(self.results_path + start_time + "_" + str(iter) + ".jpg", result.detach().numpy())
+                    torch.save(model, self.ckpt_path + start_time + "_" + str(iter) + ".pkl")
 
-
-            torch.save(model, self.ckpt_path + str(epoch) + ".pkl")
+                if iter >= end_iter:
+                    break
