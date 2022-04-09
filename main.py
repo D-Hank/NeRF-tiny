@@ -51,3 +51,4 @@ if __name__ == "__main__":
         continu = continu)
 
     run_nerf.trainer()
+    run_nerf.display()

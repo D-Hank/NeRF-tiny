@@ -1,9 +1,11 @@
 import math
 import glob
+from pprint import pprint
 import time
 import random
 import os
 import numpy as np
+import imageio
 import torch
 import torch.nn as nn
 import torch.nn.functional as functional
@@ -46,6 +48,22 @@ def seed_everything(seed):
     torch.cuda.manual_seed_all(seed)
 
 seed_everything(624)
+
+def poses_extract(batch_ray, pb_matrix):
+    # pb shape: [N_batch, 17]
+    # [N_batch, 3, 5]
+    pose = pb_matrix[ : , :-2].reshape(-1, 3, 5)
+    # Notice: near, far are not the same among pixels
+    near = pb_matrix[ : , -2]
+    far = pb_matrix[ : , -1]
+    # [N_batch, 3, 4] + [N_batch, 1, 4] -> [N_batch, 4, 4]
+    c_to_w = torch.cat((pose[ : , : , :-1], torch.tensor([[[0.0, 0.0, 0.0, 1.0]]]).repeat(batch_ray, 1, 1)), dim = 1)
+    # Note: suppose they are the same
+    # Notice: for focal: suppose unit length is 1 pixel
+    height = pose[0, 0, -1]
+    width = pose[0, 1, -1]
+    focal = pose[0, 2, -1]
+    return c_to_w, height, width, focal, near, far
 
 class Activation(nn.Module):
     def __init__(self):
@@ -277,9 +295,7 @@ class NeRFModel(nn.Module):
         sigma = torch.cat((sigma_co, sigma_fi), dim = 1)
         # (N_batch, N_c+N_f, 5)
         sort_bundle = torch.cat((t, color, sigma), dim = 2)
-        #print(sort_bundle)
         bundle, _ = torch.sort(sort_bundle, dim = 1) # drop indices here
-        #print(bundle)
 
         t = bundle[ : , : , 0] # (N_batch, N_points)
         color = bundle[ : , : , 1:4] # (N_batch, N_points, 3)
@@ -302,12 +318,22 @@ class NeRFModel(nn.Module):
 
         return loss_1 + loss_2
 
-    def forward(self, batch_hor, batch_ver, trans_mat, K_inv, near, far):
+    def forward(self, row, column, poses_bound, K_inv):
         # In picture: [x, y] = [right, down]
         # K: intrinsic matrix (K_inv)
-        #trans_mat = trans_mat.to(device)
-        #K_inv = K_inv.to(device)
-        return self.render_rays(batch_hor, batch_ver, trans_mat, K_inv, near, far)
+        K_inv = K_inv.to(device)
+        # [N_batch, 17]
+        poses_bound = poses_bound.to(torch.float)
+        c_to_w, _, __, ___, near, far = poses_extract(poses_bound)
+
+        # Note: here spatial correlation is dropped
+        # [N_batch]
+        batch_hor = row.to(device)
+        batch_ver = column.to(device)
+        # [N_batch, 4, 4]
+        c_to_w = c_to_w.to(device)
+
+        return self.render_rays(batch_hor, batch_ver, c_to_w, K_inv, near, far)
 
 
 class NeRFRunner():
@@ -344,6 +370,9 @@ class NeRFRunner():
         device = torch.device("cuda:" + str(gpu)) if torch.cuda.is_available() else torch.device("cpu")
         print("Using device", device)
 
+        self.start_time = time.strftime("%m-%d-%H-%M-%S", time.localtime())
+        print("Start at time: ", self.start_time)
+
         self.model = NeRFModel(num_coarse = n_coarse, num_fine = n_fine, batch_ray = batch_ray).to(device)
         self.results_path = results_path
         self.ckpt_path = ckpt_path
@@ -368,6 +397,9 @@ class NeRFRunner():
             print("Last iter:", last_iter)
             self.model = torch.load(last_ckpt)
 
+        else:
+            print("New running created.")
+
         self.last_iter = last_iter
 
         # -----------------------------------TRAIN-------------------------------------
@@ -380,98 +412,89 @@ class NeRFRunner():
         self.height = self.train_dataset.height
         self.width = self.train_dataset.width
         self.focal = self.train_dataset.focal
+        # inverse of intrinsic matrix
+        self.K_inv = torch.tensor([[1.0 / self.focal, 0.0, -0.5 * self.width / self.focal], [0.0, -1.0 / self.focal, 0.5 * self.height / self.focal], [0.0, 0.0, -1.0]]).to(torch.float)
         self.num_pic = self.train_dataset.pic_num
 
         # ----------------------------------DISPLAY-------------------------------------
-        #self.disp_dataset = loader.NeRFDataset(root_dir = img_dir, low_res = low_res, transform = None, type = data_type)
-        #self.disp_dataloader = DataLoader(dataset = self.train_dataset, batch_size = )
+        self.disp_dataset = loader.NeRFDataset(root_dir = img_dir, low_res = low_res, transform = None, type = data_type)
+        self.disp_dataloader = DataLoader(dataset = self.disp_dataset, batch_size = batch_ray, shuffle = False, num_workers = 4, drop_last = True)
 
-
-    def poses_extract(self, pb_matrix):
-        # pb shape: [N_batch, 17]
-        # [N_batch, 3, 5]
-        pose = pb_matrix[ : , :-2].reshape(-1, 3, 5)
-        # Notice: near, far are not the same among pixels
-        near = pb_matrix[ : , -2]
-        far = pb_matrix[ : , -1]
-        # [N_batch, 3, 4] + [N_batch, 1, 4] -> [N_batch, 4, 4]
-        c_to_w = torch.cat((pose[ : , : , :-1], torch.tensor([[[0.0, 0.0, 0.0, 1.0]]]).repeat(self.batch_ray, 1, 1)), dim = 1)
-        # Note: suppose they are the same
-        # Notice: for focal: suppose unit length is 1 pixel
-        height = pose[0, 0, -1]
-        width = pose[0, 1, -1]
-        focal = pose[0, 2, -1]
-        return c_to_w, height, width, focal, near, far
 
     def trainer(self):
-        start_time = time.strftime("%m-%d-%H-%M-%S", time.localtime())
-        print("Start training at time: ", start_time)
-        model = self.model
-        train_dataloader = self.train_dataloader
-
-        optimizer = self.optimizer
-        scheduler = self.scheduler
-
         # Suppose they are the same for all images
         height = self.height
         width = self.width
-        focal = self.focal
-        # inverse of intrinsic matrix
-        K_inv = torch.tensor([[1.0 / focal, 0.0, -0.5 * width / focal], [0.0, -1.0 / focal, 0.5 * height / focal], [0.0, 0.0, -1.0]]).to(torch.float).to(device)
+        K_inv = self.K_inv
 
         step = self.step
         end_iter = self.total_iter
         iter = self.last_iter + 1
         while (iter < end_iter):
             print("\n[ITER]\n", iter)
-            loop = tqdm(enumerate(train_dataloader), total = len(train_dataloader))
+            loop = tqdm(enumerate(self.train_dataloader), total = len(self.train_dataloader))
             # Save pic0 as a view
             result = torch.full((height, width, 3), 1.0)
             for index, (row, column, pix_val, poses_bound, pic) in loop:
-                # [N_batch, 17]
-                poses_bound = poses_bound.to(torch.float)
-                c_to_w, _, __, ___, near, far = self.poses_extract(poses_bound)
-
                 # Note: here spatial correlation is dropped
-                # [N_batch]
-                batch_y = row.to(device)
-                batch_x = column.to(device)
                 # [N_batch, N_channel]
                 C_true = pix_val.to(device)
-                # [N_batch, 4, 4]
-                c_to_w = c_to_w.to(device)
 
                 # For ray batch
-                optimizer.zero_grad()
-                model.train()
+                self.optimizer.zero_grad()
+                self.model.train()
                 # ver: 3024, hor: 4032
-                C_coarse, C_fine = model(batch_x, batch_y, c_to_w, K_inv, near, far)
-                #print(C_coarse)
-                loss = model.ray_loss(C_coarse, C_fine, C_true)
+                C_coarse, C_fine = self.model(row, column, poses_bound, K_inv)
 
+                loss = self.model.ray_loss(C_coarse, C_fine, C_true)
                 loss.backward()
-                optimizer.step()
+                self.optimizer.step()
 
                 if iter < self.decay_end:
-                    scheduler.step()
+                    self.scheduler.step()
 
                 # Use tensorboard to record
                 writer.add_scalar("loss/train", loss, iter)
-                writer.add_scalar("lr/train", optimizer.state_dict()['param_groups'][0]['lr'], iter)
+                writer.add_scalar("lr/train", self.optimizer.state_dict()['param_groups'][0]['lr'], iter)
                 writer.flush()
 
                 iter += 1
 
-                origin = result[batch_y, batch_x]
-                result[batch_y, batch_x] = torch.where(pic.unsqueeze(1) < 0.5, C_fine.cpu(), origin)
+                origin = result[row, column]
+                result[row, column] = torch.where(pic.unsqueeze(1) < 0.5, C_fine.cpu(), origin)
 
                 if (iter % step) == 0:
                     print("\n[INDEX]", index, " [LOSS] %.4f "%float(loss),
                         "[T] (%.4f"%float(C_true[0][0]),"%.4f"%float(C_true[0][1]),"%.4f)"%float(C_true[0][2]),
                         "[F] (%.4f"%float(C_fine[0][0]),"%.4f"%float(C_fine[0][1]),"%.4f)"%float(C_fine[0][2]))
 
-                    plt.imsave(self.results_path + start_time + "_" + str(iter) + ".jpg", result.detach().numpy())
-                    torch.save(model, self.ckpt_path + start_time + "_" + str(iter) + ".pkl")
+                    plt.imsave(self.results_path + self.start_time + "_" + str(iter) + ".jpg", result.detach().numpy())
+                    torch.save(self.model, self.ckpt_path + self.start_time + "_" + str(iter) + ".pkl")
 
                 if iter >= end_iter:
                     break
+
+
+    #@torch.no_grad
+    def display(self):
+        print("Start generating video...")
+
+        height = self.height
+        width = self.width
+        K_inv = self.K_inv
+
+        with torch.no_grad():
+            loop = tqdm(enumerate(self.disp_dataloader), total = len(self.disp_dataloader))
+            # (N_pic, H, W, 3)
+            result = torch.full((self.num_pic, height, width, 3), 1.0)
+            for index, (row, column, pix_val, poses_bound, pic) in loop:
+                self.model.eval()
+                C_coarse, C_fine = self.model(row, column, poses_bound, K_inv)
+
+                # [0, 1] -> [0, 255]
+                #result[pic, row, column] = pix_val * 255.0
+                result[pic, row, column] = C_fine.cpu() * 255.0
+
+        # Notice: remember to convert to uint8 for video!
+        imageio.mimwrite(self.results_path + self.start_time + "_" + str(self.last_iter) + ".mp4", result.numpy().astype(np.uint8), fps = 30)
+
