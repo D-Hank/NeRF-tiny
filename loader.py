@@ -76,13 +76,14 @@ class NeRFDataset(Dataset):
         self.height = int(self.poses_bounds[0][4])
         self.width = int(self.poses_bounds[0][9])
         self.focal = self.poses_bounds[0][14]
-        pic_size = self.height * self.width
-        self.num_pix = pic_size * self.pic_num
+        self.pic_size = self.height * self.width
+        self.num_pix = self.pic_size * self.pic_num
 
         all_img = torch.zeros(self.pic_num, self.height, self.width, 3)
         for i in range(0, self.pic_num):
             all_img[i] = torch.tensor(self.get_img(self.file_list[i]))
 
+        # (N_pic, height, width, 3) -> (N_pic * H * W, 3)
         all_pix = torch.flatten(all_img, start_dim = 0, end_dim = 2)
         # Order: this pixel is which pixel among all pixels
         pix_id = torch.arange(0, self.num_pix, 1).unsqueeze(1)
@@ -120,9 +121,9 @@ class NeRFDataset(Dataset):
         pix_val = pixel[0 : 3]
         pix_id = int(pixel[3])
         # belongs to which pic
-        pic = pix_id % self.pic_num
+        pic = pix_id // self.pic_size
         # which pix in this pic
-        id_in_pic = pix_id // self.pic_num
+        id_in_pic = pix_id % self.pic_size
         # which row
         row = id_in_pic // self.width
         # which column
