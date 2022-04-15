@@ -1,12 +1,12 @@
 import math
 import glob
-from pprint import pprint
 import time
 import random
 import os
 import numpy as np
 import imageio
 import torch
+import torch.multiprocessing
 import torch.nn as nn
 import torch.nn.functional as functional
 import matplotlib.pyplot as plt
@@ -49,8 +49,9 @@ def seed_everything(seed):
 
 seed_everything(624)
 
-def poses_extract(batch_ray, pb_matrix):
+def poses_extract(pb_matrix):
     # pb shape: [N_batch, 17]
+    batch_ray = pb_matrix.shape[0]
     # [N_batch, 3, 5]
     pose = pb_matrix[ : , :-2].reshape(-1, 3, 5)
     # Notice: near, far are not the same among pixels
@@ -90,7 +91,7 @@ class Network(nn.Module):
                 self.point_layer.append(torch.nn.Sequential(torch.nn.Linear(width, width), torch.nn.ReLU(True)))
 
         # Note: no need in (0, 1) ?
-        self.sigma_layer = torch.nn.Sequential(torch.nn.Linear(width, 1), torch.nn.Softplus())
+        self.sigma_layer = torch.nn.Sequential(torch.nn.Linear(width, 1), Activation())
         # Build layers for direction coordinates
         self.point_info = torch.nn.Linear(width, width)
         # get a 128-D feature vector
@@ -336,6 +337,8 @@ class NeRFModel(nn.Module):
         return self.render_rays(batch_hor, batch_ver, c_to_w, K_inv, near, far)
 
 
+# ----------------------------------START OF THE ALTORITHM-----------------------------------
+
 class NeRFRunner():
     def __init__(
         self,
@@ -359,6 +362,9 @@ class NeRFRunner():
 
         # -----------------------------------GLOBAL-----------------------------------
         plt.set_cmap("cividis")
+
+        # Open a large bulk of images concurrently
+        torch.multiprocessing.set_sharing_strategy('file_system')
 
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
@@ -395,7 +401,7 @@ class NeRFRunner():
                     last_ckpt = file
 
             print("Last iter:", last_iter)
-            self.model = torch.load(last_ckpt)
+            self.model = torch.load(last_ckpt).to(device)
 
         else:
             print("New running created.")
@@ -405,9 +411,9 @@ class NeRFRunner():
         # -----------------------------------TRAIN-------------------------------------
         self.train_dataset = loader.NeRFDataset(root_dir = img_dir, low_res = low_res, transform = None, type = data_type)
         self.train_dataloader = DataLoader(dataset = self.train_dataset, batch_size = batch_ray, shuffle = True, num_workers = 4, drop_last = True)
-        self.optimizer = torch.optim.Adam(self.model.network.parameters(), lr = learning, betas = (0.9, 0.999), eps = 1e-7)
-        self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda = lambda iter: lr_gamma ** (iter / decay_end)) if sched == "EXP" else \
-                         torch.optim.lr_scheduler.MultiStepLR(self.optimizer, lr_milestone, lr_gamma)
+        self.optimizer = torch.optim.Adam([{"params": self.model.network.parameters(), "initial_lr": learning}], lr = learning, betas = (0.9, 0.999), eps = 1e-7)
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda = lambda iter: lr_gamma ** (iter / decay_end) if iter < decay_end else lr_gamma * learning, last_epoch = self.last_iter) if sched == "EXP" else \
+                         torch.optim.lr_scheduler.MultiStepLR(self.optimizer, lr_milestone, lr_gamma, last_epoch = self.last_iter)
 
         self.height = self.train_dataset.height
         self.width = self.train_dataset.width
@@ -449,27 +455,25 @@ class NeRFRunner():
                 loss = self.model.ray_loss(C_coarse, C_fine, C_true)
                 loss.backward()
                 self.optimizer.step()
-
-                if iter < self.decay_end:
-                    self.scheduler.step()
+                self.scheduler.step()
 
                 # Use tensorboard to record
                 writer.add_scalar("loss/train", loss, iter)
                 writer.add_scalar("lr/train", self.optimizer.state_dict()['param_groups'][0]['lr'], iter)
                 writer.flush()
 
-                iter += 1
-
                 origin = result[row, column]
                 result[row, column] = torch.where(pic.unsqueeze(1) < 0.5, C_fine.cpu(), origin)
 
-                if (iter % step) == 0:
+                if ((iter + 1) % step) == 0:
                     print("\n[INDEX]", index, " [LOSS] %.4f "%float(loss),
                         "[T] (%.4f"%float(C_true[0][0]),"%.4f"%float(C_true[0][1]),"%.4f)"%float(C_true[0][2]),
                         "[F] (%.4f"%float(C_fine[0][0]),"%.4f"%float(C_fine[0][1]),"%.4f)"%float(C_fine[0][2]))
 
                     plt.imsave(self.results_path + self.start_time + "_" + str(iter) + ".jpg", result.detach().numpy())
                     torch.save(self.model, self.ckpt_path + self.start_time + "_" + str(iter) + ".pkl")
+
+                iter += 1
 
                 if iter >= end_iter:
                     break
@@ -492,9 +496,16 @@ class NeRFRunner():
                 C_coarse, C_fine = self.model(row, column, poses_bound, K_inv)
 
                 # [0, 1] -> [0, 255]
-                #result[pic, row, column] = pix_val * 255.0
-                result[pic, row, column] = C_fine.cpu() * 255.0
+                #result[pic, row, column] = pix_val
+                result[pic, row, column] = C_fine.cpu()
+
+        result = result.numpy()
+        save_dir = self.results_path + self.start_time + "/"
+        os.makedirs(save_dir, exist_ok = True)
+        for i in range(0, self.num_pic, 1):
+            plt.imsave(save_dir + str(i) + ".jpg", result[i])
 
         # Notice: remember to convert to uint8 for video!
-        imageio.mimwrite(self.results_path + self.start_time + "_" + str(self.last_iter) + ".mp4", result.numpy().astype(np.uint8), fps = 30)
+        result = result * 255.0
+        imageio.mimwrite(self.results_path + self.start_time + "_" + str(self.last_iter) + ".mp4", result.astype(np.uint8), fps = 30)
 
