@@ -188,16 +188,18 @@ class NeRFModel(nn.Module):
             batch_y.unsqueeze(0),
             torch.ones(1, self.batch_ray).to(device)), dim = 0)
         # Pixel coordinates -> Camara coordinates
-        # (3, N_batch) -> (3, N_batch, N_points) -> (N_batch, N_points, 3)
-        # Broadcast multiplication: (N_batch, N_points, 3) * (3, 3) -> (N_batch, N_points, 3)
-        points_scale = torch.matmul(xy_hom.unsqueeze(2).repeat(1, 1, num_points).permute(1, 2, 0), K_inv.transpose(0, 1))
-        # Scaled by t, use t as z_c
-        points_cam = torch.mul(points_scale, t_array.unsqueeze(2).repeat(1, 1, 3))
-        # (N_batch, N_points, 4)
+        # (3, N_batch) -> (3, N_batch, 1) -> (N_batch, 1, 3)
+        # Broadcast multiplication: (N_batch, 1, 3) * (3, 3) -> (N_batch, 1, 3)
+        # Let z_c = -f, then x_c = x - 0.5*w, y_c = -y + 0.5*h
+        points_scale = torch.matmul(xy_hom.unsqueeze(2).permute(1, 2, 0), K_inv)
+        # Notice: use `NORMALIZE` to transform into unit vector
+        # (N_batch, 1, 3) -> (N_batch, N_points, 3)
+        dir_cam = functional.normalize(points_scale, p = 2.0, dim = 2).repeat(1, num_points, 1)
+        # Scaled by t, the distance from a point to camara origin (in a sphere)
+        # Note: here dir_cam is NORMALIZED points, with NORM = 1
+        points_cam = torch.mul(dir_cam, t_array.unsqueeze(2).repeat(1, 1, 3))
+        # (N_batch, N_points, 3) -> (N_batch, N_points, 4)
         points_cam = torch.cat((points_cam, torch.ones((self.batch_ray, num_points, 1)).to(device)), dim = 2)
-        # Notice: dir vector is computed the same way as points, but we use `norm` here!
-        # (N_batch, N_points, 3)
-        dir_cam = functional.normalize(points_scale, p = 2.0, dim = 2)
         # [[x, y, z, 1], [x, y, z, 1], ...], points in batch
         # (N_batch, 4, 4) -> (N_batch, N_points, 4, 4)
         batch_mat = trans_mat.unsqueeze(1).repeat(1, num_points, 1, 1)
@@ -209,6 +211,7 @@ class NeRFModel(nn.Module):
         dir_wrd = torch.matmul(batch_mat[ : , : , : 3, : 3], dir_cam.unsqueeze(3)).squeeze()
 
         # [[[R,G,B], [R,G,B], ... * points], ... * batch]
+        # For t: NORM is invariant under rigid transformation
         # (N_batch, N_points, 3)
         points_wrd = points_wrd[ : , : , :3]
 
@@ -418,8 +421,8 @@ class NeRFRunner():
         self.height = self.train_dataset.height
         self.width = self.train_dataset.width
         self.focal = self.train_dataset.focal
-        # inverse of intrinsic matrix
-        self.K_inv = torch.tensor([[1.0 / self.focal, 0.0, -0.5 * self.width / self.focal], [0.0, -1.0 / self.focal, 0.5 * self.height / self.focal], [0.0, 0.0, -1.0]]).to(torch.float)
+        # inverse of intrinsic matrix, then transpose it
+        self.K_inv = torch.tensor([[1.0, 0.0, -0.5 * self.width], [0.0, -1.0, 0.5 * self.height], [0.0, 0.0, -self.focal]]).to(torch.float).transpose(0, 1)
         self.num_pic = self.train_dataset.pic_num
 
         # ----------------------------------DISPLAY-------------------------------------

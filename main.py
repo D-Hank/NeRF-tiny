@@ -9,7 +9,7 @@ CONF_DIR = "./conf/"
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description = "NeRF argument parser.")
-    parser.add_argument("--conf", type = str, default = "fern")
+    parser.add_argument("--conf", type = str, default = "lego")
     args = parser.parse_args()
 
     conf = ConfigParser()
@@ -31,7 +31,7 @@ if __name__ == "__main__":
     step            =   int(conf.get(args.conf, "STEP"))
     decay_end       = float(conf.get(args.conf, "DECAY_END"))
     sched           =       conf.get(args.conf, "SCHED")
-    continu         =  bool(conf.get(args.conf, "CONTINU"))
+    continu         =  eval(conf.get(args.conf, "CONTINU"))
 
     run_nerf = NeRFRunner(
         gpu = gpu,
@@ -49,7 +49,7 @@ if __name__ == "__main__":
         data_type = data_type,
         step = step,
         decay_end = decay_end,
-        sched = "EXP",
+        sched = sched,
         continu = continu)
 
     run_nerf.trainer()

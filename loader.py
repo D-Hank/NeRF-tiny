@@ -1,3 +1,4 @@
+from logging import root
 import numpy as np
 import os
 import json
@@ -52,11 +53,24 @@ def convert_npy(root_dir):
 
     np.save(root_dir + "new.npy", dest_trans)
 
+def pic_rename(root_dir, recover = False):
+    # Notice: Renaming for openning in order
+    img_dir = root_dir + "train/"
+    for file in os.listdir(img_dir):
+        num = file.split("_")[-1][:-4]
+        if recover == False:
+            num = num.zfill(2)
+            os.rename(img_dir + file, img_dir + "n_" + num + ".png")
+        else:
+            num = int(num)
+            os.rename(img_dir + file, img_dir + "r_" + str(num) + ".png")
+
 def data_preprocess(root_dir, type):
     if type == "llff":
         convert_npy(root_dir)
     else:
         create_npy(root_dir)
+        pic_rename(root_dir)
 
 class NeRFDataset(Dataset):
     # REFERENCE: https://stackoverflow.com/questions/9166400/convert-rgba-png-to-rgb-with-pil
@@ -127,7 +141,4 @@ class NeRFDataset(Dataset):
         column = id_in_pic % self.width
         poses_bound = self.poses_bounds[pic]
 
-        return row, column, pix_val, poses_bound
-
-    def test(self, idx):
-        return self.__getitem__(idx)
+        return row, column, pix_val, poses_bound, pic
