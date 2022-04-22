@@ -90,7 +90,7 @@ class Network(nn.Module):
             else:
                 self.point_layer.append(torch.nn.Sequential(torch.nn.Linear(width, width), torch.nn.ReLU(True)))
 
-        # Note: no need in (0, 1) ?
+        # Use `abs` to avoid negativity
         self.sigma_layer = torch.nn.Sequential(torch.nn.Linear(width, 1), Activation())
         # Build layers for direction coordinates
         self.point_info = torch.nn.Linear(width, width)
@@ -222,13 +222,11 @@ class NeRFModel(nn.Module):
         return color, sigma
 
     # Get cdf of coarse sampling, then with its reverse, we use uniform sampling along the horizontal axis
-    def resample(self, t_coarse, sigma_coarse):
+    def resample(self, t_coarse, dense_coarse):
         # t_coarse: (N_batch, N_c)
-        # sigma_coarse: (N_batch, N_c, 1) -> (N_batch, N_c)
-        sigma_coarse = sigma_coarse.squeeze()
-
+        # dense_coarse: (N_batch, N_c)
         # (N_batch, N_c)
-        cdf = torch.cumsum(sigma_coarse, dim = 1).contiguous()
+        cdf = torch.cumsum(dense_coarse, dim = 1).contiguous()
         # drop indices
         # shape: (N_batch)
         high, _ = torch.max(cdf, dim = 1)
@@ -238,7 +236,7 @@ class NeRFModel(nn.Module):
         # Slope of cdf is not zero, so its inverse is not infinite
         # cdf - cdf = sigma
         # Add epsilon to avoid zero-division
-        slope_inv = delta / (sigma_coarse[ : , 1: ] + EPSILON)
+        slope_inv = delta / (dense_coarse[ : , 1: ] + EPSILON)
         high = high.detach().cpu().numpy()
         low = low.detach().cpu().numpy()
         # (N_fine+2, N_batch)
@@ -262,16 +260,22 @@ class NeRFModel(nn.Module):
 
         return t_fine
 
-    def color_cum(self, delta, sigma, color):
+    def get_density(self, delta, sigma):
         # delta: (N_batch, N_points)
         # sigma: (N_batch, N_points)
-        # color: (N_batch, N_points, 3)
         sigma_delta = torch.mul(delta, sigma)
         sum_sd = torch.cumsum(sigma_delta, dim = 1)
         T = torch.exp(-sum_sd)
-        # (N_batch, N_points) -> (N_batch, N_points, 1)
-        t_exp = torch.mul(T, 1 - torch.exp(-sigma_delta)).unsqueeze(2)
-        term = torch.mul(color, t_exp)
+        # (N_batch, N_points)
+        t_exp = torch.mul(T, 1 - torch.exp(-sigma_delta))
+
+        return t_exp
+
+    def color_cum(self, density, color):
+        # density: (N_batch, N_points)
+        # color: (N_batch, N_points, 3)
+        # (N_batch, N_points) -> (N_batch, N_points, 1) -> (N_batch, N_points, 3)
+        term = torch.mul(color, density.unsqueeze(2))
         result = torch.sum(term, dim = 1)
 
         return result
@@ -284,14 +288,16 @@ class NeRFModel(nn.Module):
         t_coarse = torch.tensor(np.linspace(tuple(near), tuple(far), self.num_coarse)).transpose(0, 1).to(device)
         color_co, sigma_co = self.net_out(t_coarse, batch_hor, batch_ver, trans_mat, K_inv, self.num_coarse)
 
-        # Shape as (N_batch, N_f)
-        t_fine = self.resample(t_coarse, sigma_co)
-        color_fi, sigma_fi = self.net_out(t_fine, batch_hor, batch_ver, trans_mat, K_inv, self.num_fine)
-
-        # Note: here t is for camara or world?
         # far, near: (N_batch)
         # (N_batch, N_c)
         delta_co = ((far - near) / self.num_coarse).unsqueeze(1).repeat(1, self.num_coarse).to(device)
+        # sigma: (N_batch, N_c, 1) -> (N_batch, N_c)
+        dense_co = self.get_density(delta_co, sigma_co.squeeze())
+
+        # Shape as (N_batch, N_f)
+        t_fine = self.resample(t_coarse, dense_co)
+        color_fi, sigma_fi = self.net_out(t_fine, batch_hor, batch_ver, trans_mat, K_inv, self.num_fine)
+
         # (N_batch, N_c) + (N_batch, N_f) -> (N_batch, N_c+N_f) -> (N_batch, N, 1)
         t = torch.cat((t_coarse, t_fine), dim = 1).unsqueeze(2)
         # (N_batch, N_point, N_channel), N_point = N_c + N_f
@@ -307,10 +313,12 @@ class NeRFModel(nn.Module):
 
         # Add a tiny interval at the tail
         delta = torch.cat((t[ : , 1: ] - t[ : , :-1], torch.full((self.batch_ray, 1), last).to(device)), dim = 1)
+        # Recompute since delta is changed
+        dense = self.get_density(delta, sigma)
 
         # (N_batch, 3)
-        C_coarse = self.color_cum(delta_co, sigma_co[ : , : , 0], color_co)
-        C_fine = self.color_cum(delta, sigma, color)
+        C_coarse = self.color_cum(dense_co, color_co)
+        C_fine = self.color_cum(dense, color)
 
         return C_coarse, C_fine
 
@@ -361,7 +369,7 @@ class NeRFRunner():
         step = STEP,
         decay_end = DECAY_END,
         sched = "EXP",
-        continu = False):
+        continue_ = False):
 
         # -----------------------------------GLOBAL-----------------------------------
         plt.set_cmap("cividis")
@@ -395,7 +403,7 @@ class NeRFRunner():
         # Notice: repeated data are possible!
         ck_list = glob.glob(ckpt_path + "*.pkl")
         last_iter = -1
-        if continu == True and ck_list:
+        if continue_ == True and ck_list:
             for file in ck_list:
                 ck = file.split("_")[-1]
                 it = int(ck[ : -4])
@@ -412,7 +420,7 @@ class NeRFRunner():
         self.last_iter = last_iter
 
         # -----------------------------------TRAIN-------------------------------------
-        self.train_dataset = loader.NeRFDataset(root_dir = img_dir, low_res = low_res, transform = None, type = data_type)
+        self.train_dataset = loader.NeRFDataset(root_dir = img_dir, low_res = low_res, transform = None, type = data_type, mode = "train")
         self.train_dataloader = DataLoader(dataset = self.train_dataset, batch_size = batch_ray, shuffle = True, num_workers = 4, drop_last = True)
         self.optimizer = torch.optim.Adam([{"params": self.model.network.parameters(), "initial_lr": learning}], lr = learning, betas = (0.9, 0.999), eps = 1e-7)
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda = lambda iter: lr_gamma ** (iter / decay_end) if iter < decay_end else lr_gamma * learning, last_epoch = self.last_iter) if sched == "EXP" else \
@@ -426,7 +434,7 @@ class NeRFRunner():
         self.num_pic = self.train_dataset.pic_num
 
         # ----------------------------------DISPLAY-------------------------------------
-        self.disp_dataset = loader.NeRFDataset(root_dir = img_dir, low_res = low_res, transform = None, type = data_type)
+        self.disp_dataset = loader.NeRFDataset(root_dir = img_dir, low_res = low_res, transform = None, type = data_type, mode = "test")
         self.disp_dataloader = DataLoader(dataset = self.disp_dataset, batch_size = batch_ray, shuffle = False, num_workers = 4, drop_last = True)
 
 
@@ -482,6 +490,7 @@ class NeRFRunner():
                     break
 
 
+    # test_mode
     #@torch.no_grad
     def display(self):
         print("Start generating video...")

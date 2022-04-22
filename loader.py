@@ -1,10 +1,10 @@
 import numpy as np
 import os
 import json
-
-from PIL import Image
 import torch
+
 from torch.utils.data import Dataset
+from PIL import Image
 
 NEAR_FACTOR = 2.0
 FAR_FACTOR = 6.0
@@ -20,7 +20,7 @@ def create_npy(root_dir):
     # read one img to see
     img_0 = Image.open(root_dir + frame[0]['file_path'][2: ] + ".png")
     width, height = img_0.size
-    focal = 0.5 * width * np.tan(0.5 * angle)
+    focal = 0.5 * width / np.tan(0.5 * angle)
     near = NEAR_FACTOR
     far = FAR_FACTOR
 
@@ -87,7 +87,7 @@ class NeRFDataset(Dataset):
         # with: W -> H -> N_pic
         self.all_pix = torch.flatten(all_img, start_dim = 0, end_dim = 2)
 
-    def __init__(self, root_dir, low_res = 8, transform = None, type = "sync"):
+    def __init__(self, root_dir, low_res = 8, transform = None, type = "sync", mode = "train"):
         self.root_dir = root_dir
         self.low_res = low_res
         self.transform = transform
@@ -100,7 +100,7 @@ class NeRFDataset(Dataset):
 
         self.poses_bounds = np.load(root_dir + "new.npy")
 
-        img_dir = root_dir + ("train/" if type == "sync" else "images/")
+        img_dir = root_dir + ("images/" if type == "llff" else (mode + "/"))
 
         for file in os.listdir(img_dir):
             self.file_list.append(os.path.join(img_dir, file))

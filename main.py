@@ -31,7 +31,7 @@ if __name__ == "__main__":
     step            =   int(conf.get(args.conf, "STEP"))
     decay_end       = float(conf.get(args.conf, "DECAY_END"))
     sched           =       conf.get(args.conf, "SCHED")
-    continu         =  eval(conf.get(args.conf, "CONTINU"))
+    continue_       =  eval(conf.get(args.conf, "CONTINUE"))
 
     run_nerf = NeRFRunner(
         gpu = gpu,
@@ -50,7 +50,7 @@ if __name__ == "__main__":
         step = step,
         decay_end = decay_end,
         sched = sched,
-        continu = continu)
+        continue_ = continue_)
 
     run_nerf.trainer()
     run_nerf.display()
