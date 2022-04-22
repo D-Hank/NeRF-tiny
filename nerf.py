@@ -466,7 +466,7 @@ class NeRFRunner():
                 writer.flush()
 
                 origin = result[row, column]
-                result[row, column] = torch.where(pic.unsqueeze(1) < 0.5, C_fine.cpu(), origin)
+                result[row, column] = torch.where(pic.unsqueeze(1) < 0.5, C_true.cpu(), origin)
 
                 if ((iter + 1) % step) == 0:
                     print("\n[INDEX]", index, " [LOSS] %.4f "%float(loss),
