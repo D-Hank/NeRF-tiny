@@ -433,12 +433,18 @@ class NeRFRunner():
         self.K_inv = torch.tensor([[1.0, 0.0, -0.5 * self.width], [0.0, -1.0, 0.5 * self.height], [0.0, 0.0, -self.focal]]).to(torch.float).transpose(0, 1)
         self.num_pic = self.train_dataset.pic_num
 
+        # ----------------------------------VALIDATE------------------------------------
+        self.val_dataset = loader.NeRFDataset(root_dir = img_dir, low_res = low_res, transform = None, type = data_type, mode = "val")
+        self.val_dataloader = DataLoader(dataset = self.val_dataset, batch_size = batch_ray, shuffle = True, num_workers = 4, drop_last = True)
+
         # ----------------------------------DISPLAY-------------------------------------
         self.disp_dataset = loader.NeRFDataset(root_dir = img_dir, low_res = low_res, transform = None, type = data_type, mode = "test")
         self.disp_dataloader = DataLoader(dataset = self.disp_dataset, batch_size = batch_ray, shuffle = False, num_workers = 4, drop_last = True)
 
 
-    def trainer(self):
+    def trainer(self, mode):
+        print("[STEP] " + mode)
+        dataloader = eval("self." + mode + "_dataloader")
         # Suppose they are the same for all images
         height = self.height
         width = self.width
@@ -449,8 +455,8 @@ class NeRFRunner():
         iter = self.last_iter + 1
         while (iter < end_iter):
             print("\n[ITER]\n", iter)
-            loop = tqdm(enumerate(self.train_dataloader), total = len(self.train_dataloader))
-            # Save pic0 as a view
+            loop = tqdm(enumerate(dataloader), total = len(dataloader))
+            # Save pic0 as a view window
             result = torch.full((height, width, 3), 1.0)
             for index, (row, column, pix_val, poses_bound, pic) in loop:
                 # Note: here spatial correlation is dropped
@@ -469,8 +475,8 @@ class NeRFRunner():
                 self.scheduler.step()
 
                 # Use tensorboard to record
-                writer.add_scalar("loss/train", loss, iter)
-                writer.add_scalar("lr/train", self.optimizer.state_dict()['param_groups'][0]['lr'], iter)
+                writer.add_scalar("loss/" + mode, loss, iter)
+                writer.add_scalar("lr/" + mode, self.optimizer.state_dict()['param_groups'][0]['lr'], iter)
                 writer.flush()
 
                 origin = result[row, column]
@@ -489,9 +495,11 @@ class NeRFRunner():
                 if iter >= end_iter:
                     break
 
+            if (mode == "val"):
+                break
+
 
     # test_mode
-    #@torch.no_grad
     def display(self):
         print("Start generating video...")
 
@@ -502,16 +510,16 @@ class NeRFRunner():
         with torch.no_grad():
             loop = tqdm(enumerate(self.disp_dataloader), total = len(self.disp_dataloader))
             # (N_pic, H, W, 3)
-            result = torch.full((self.num_pic, height, width, 3), 1.0)
+            result = torch.full((self.num_pic, height, width, 3), 1.0).to(device)
             for index, (row, column, pix_val, poses_bound, pic) in loop:
                 self.model.eval()
                 C_coarse, C_fine = self.model(row, column, poses_bound, K_inv)
 
                 # [0, 1] -> [0, 255]
                 #result[pic, row, column] = pix_val
-                result[pic, row, column] = C_fine.cpu()
+                result[pic, row, column] = C_fine
 
-        result = result.numpy()
+        result = result.cpu().numpy()
         save_dir = self.results_path + self.start_time + "/"
         os.makedirs(save_dir, exist_ok = True)
         for i in range(0, self.num_pic, 1):

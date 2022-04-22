@@ -9,8 +9,8 @@ from PIL import Image
 NEAR_FACTOR = 2.0
 FAR_FACTOR = 6.0
 
-def create_npy(root_dir):
-    with open(root_dir + "transforms_train.json") as json_file:
+def create_npy(root_dir, mode):
+    with open(root_dir + "transforms_" + mode + ".json") as json_file:
         jf = json.load(json_file)
 
     angle = jf['camera_angle_x']
@@ -33,7 +33,7 @@ def create_npy(root_dir):
         poses_bound = np.concatenate((np.concatenate((matrix[ :3, :4], np.array([[height], [width], [focal]])), axis = 1).flatten(), np.array([near, far])), axis = 0)
         poses_bounds[i] = poses_bound
 
-    np.save(root_dir + "new.npy", poses_bounds)
+    np.save(root_dir + mode + ".npy", poses_bounds)
 
 def convert_npy(root_dir):
     src_trans = np.load(root_dir + "poses_bounds.npy")
@@ -52,11 +52,11 @@ def convert_npy(root_dir):
 
     np.save(root_dir + "new.npy", dest_trans)
 
-def data_preprocess(root_dir, type):
+def data_preprocess(root_dir, type, mode):
     if type == "llff":
         convert_npy(root_dir)
     else:
-        create_npy(root_dir)
+        create_npy(root_dir, mode)
 
 class NeRFDataset(Dataset):
     # REFERENCE: https://stackoverflow.com/questions/9166400/convert-rgba-png-to-rgb-with-pil
@@ -95,10 +95,12 @@ class NeRFDataset(Dataset):
         self.pic_num = 0
         self.type = type
 
-        if os.path.isfile(root_dir + "new.npy") == False:
-            data_preprocess(root_dir, type)
+        trans_path = root_dir + ("new.npy" if type == "llff" else (mode + ".npy"))
 
-        self.poses_bounds = np.load(root_dir + "new.npy")
+        if os.path.isfile(trans_path) == False:
+            data_preprocess(root_dir, type, mode)
+
+        self.poses_bounds = np.load(trans_path)
 
         img_dir = root_dir + ("images/" if type == "llff" else (mode + "/"))
 
